@@ -1,0 +1,17 @@
+# Project Atlas - Dependencies
+# Install with: pip install -r requirements.txt
+
+# CEX WebSocket Data (Binance Futures)
+ccxt>=4.0.0
+
+# HTTP Client for Limitless API
+aiohttp>=3.9.0
+
+# Environment Variable Management
+python-dotenv>=1.0.0
+
+# WebSocket Client for Limitless real-time data
+python-socketio[asyncio_client]>=5.10.0
+
+# Ethereum signing for order execution
+eth-account>=0.11.0
