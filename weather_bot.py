@@ -783,12 +783,12 @@ class WeatherBot:
         else:
             print(f"[SETTLEMENT] No trades to settle for {report_date}")
 
-    async def run_loop(self, interval: int = 300):
-        """Run continuous scanning loop."""
+    async def run_loop(self, interval: int = 1800):
+        """Run continuous scanning loop. Default: 30 minutes."""
         while self.running:
             try:
                 await self.scan_once()
-                print(f"\n[WAIT] Next scan in {interval}s...")
+                print(f"\n[WAIT] Next scan in {interval//60} minutes...")
                 await asyncio.sleep(interval)
             except KeyboardInterrupt:
                 break
