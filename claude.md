@@ -1,97 +1,223 @@
-Here is the **Project Atlas** planning document. This is optimized for you to copy-paste directly into a new chat with Claude (or ChatGPT). It contains the full context, the mathematical edge, and the technical constraints so the AI can write high-quality code immediately.
-
-***
-
-# Project Atlas: High-Frequency Latency Arbitrage Bot
+# Project: Kalshi Weather Trading Bot
 
 ## 1. Executive Summary
-**Objective:** Build a Python-based arbitrage bot that exploits time-latency discrepancies between Centralized Exchanges (Binance/Coinbase) and On-Chain Prediction Markets (Limitless on Base L2).
-**Core Thesis:** On-chain order books lag behind CEX price feeds by 1–3 seconds due to block times and Market Maker latency. We use CEX volatility as a leading indicator to "snipe" stale limit orders on-chain.
-**Primary Venue:** Limitless Exchange (Base Network).
-**Secondary Venue:** PancakeSwap Prediction (BNB Chain).
 
-## 2. Technical Architecture
+**Objective:** Automated trading bot for Kalshi's NYC high temperature markets (KXHIGHNY) that exploits mispricings between professional weather model forecasts and market prices.
 
-### 2.1 Tech Stack
-*   **Language:** Python 3.10+ (AsyncIO).
-*   **CEX Data (The "Truth"):** `ccxt` (Pro/Async) using WebSockets.
-*   **On-Chain Interaction:** `web3.py` (AsyncHTTPProvider).
-*   **Signing:** `eth_account`.
-*   **Environment:** Linux VPS (Ubuntu) in US-East (N. Virginia).
+**Core Thesis:** Professional weather models (ECMWF, GFS) are more accurate than retail trader guesses. When models agree but the market prices a different bracket, we have a high-probability edge.
 
-### 2.2 Infrastructure Requirements
-*   **RPC Provider:** **Alchemy** (Base) or **QuickNode** (BNB). *Strict Requirement: Private/Paid endpoints to avoid rate limits and minimize latency.*
-*   **Wallet:** Dedicated EOA (Externally Owned Account) for high-frequency signing.
-*   **Chain:** Base Mainnet (Chain ID: 8453).
+**Target Win Rate:** 75-85%
+**Primary Market:** KXHIGHNY (NYC Daily High Temperature)
+**Legal Status:** CFTC-regulated, legal in all US states including NYC
 
-## 3. Strategy 1: Limitless Exchange (Order Book Sniping)
+## 2. The Strategy
 
-### 3.1 The Mechanism
-Limitless uses a **CLOB (Central Limit Order Book)**. Market Makers place limit orders (Bids/Asks) representing probabilities (0.00 to 1.00).
+### 2.1 The Edge
+Weather prediction markets are inefficient because:
+1. Retail traders often follow outdated NWS forecasts
+2. Professional models (ECMWF, GFS) update 4x daily with higher accuracy
+3. When both models agree, confidence reaches ~90%
+4. Markets often misprice by 20-70 percentage points
 
-### 3.2 The Trigger Logic
-1.  **Monitor:** Listen to Binance Futures WebSocket (`BTC/USDT`).
-2.  **Detect:** Calculate `Velocity = Price_Current - Price_1s_Ago`.
-3.  **Signal:** `IF abs(Velocity) > Threshold` (e.g., $50 jump in 1s).
-4.  **Scan:** Immediately query the Limitless Smart Contract for the "Best Ask" (if Bullish) or "Best Bid" (if Bearish).
+### 2.2 Model Accuracy
+| Model | Provider | Accuracy (1-day) | Update Frequency |
+|-------|----------|------------------|------------------|
+| ECMWF | European Centre | ~85% | 4x daily |
+| GFS | NOAA | ~80% | 4x daily |
+| Combined (when agree) | - | ~90% | - |
 
-### 3.3 The Profit Formula (EV)
-Before executing, the bot must pass this strict EV check:
+### 2.3 Trading Logic
+```
+1. Fetch GFS and ECMWF forecasts for NYC
+2. Check if models agree (within 2°F)
+3. Determine which bracket the average temp falls into
+4. Get Kalshi market prices for that bracket
+5. Calculate edge = model_confidence - market_price
+6. If edge > 20% and models disagree with market favorite → TRADE
+```
 
-$$ \text{ProjectedProfit} = (\text{Size} \times (\text{TrueProb} - \text{MarketProb})) - \text{TotalCost} $$
+## 3. Market Structure
 
-*   **TrueProb:** Derived from live Binance Price (e.g., if Price > Strike, Prob $\approx$ 0.99).
-*   **MarketProb:** The price of the stale Limit Order on Limitless.
-*   **TotalCost:** `GasFee` + `Slippage` + **`AdaptiveTakerFee`**.
+### 3.1 KXHIGHNY (NYC High Temperature)
+- **Location:** Central Park, NYC (40.7829, -73.9654)
+- **Settlement:** NWS CLI report next morning
+- **Brackets:** 6 per day (dynamic based on forecast range)
+- **Market Opens:** ~10 AM day before
+- **Market Closes:** Evening before settlement
 
-### 3.4 Critical Constraints (The "Kill Switches")
-*   **Fee Warning:** Limitless uses **Adaptive Fees** that scale up to 3% near expiration.
-    *   *Constraint:* `IF Time_To_Expiry < 15 Minutes: ABORT TRADE`.
-*   **Liquidity Check:**
-    *   *Constraint:* `IF Order_Depth_Amount < Trade_Size: ABORT` (Avoids slippage).
+### 3.2 Bracket Examples
+```
+Typical winter day brackets:
+├── T39: <39°F (extreme cold)
+├── B39.5: 39-40°F
+├── B41.5: 41-42°F
+├── B43.5: 43-44°F
+├── B45.5: 45-46°F
+└── T46: >46°F (warm)
 
-## 4. Strategy 2: PancakeSwap Prediction (Last-Block Sniping)
+Note: Brackets are DYNAMIC - they change daily based on expected temp range
+```
 
-### 4.1 The Mechanism
-Parimutuel "Up/Down" pools. The "Lock Price" is determined at the exact block the round starts.
+### 3.3 Ticker Format
+`KXHIGHNY-{YY}{MMM}{DD}-{BRACKET}`
 
-### 4.2 The Trigger Logic
-1.  **Wait:** Idle until `Time_Remaining < 5 Seconds`.
-2.  **Compare:** Check `Prize_Pool_Ratio` vs. `Binance_Technical_Indicators` (RSI/Momentum).
-3.  **Execute:** If `Pool_Odds > Calculated_Odds`, submit transaction with **High Priority Fee** to land in the final block.
+Examples:
+- `KXHIGHNY-26JAN12-B39.5` → Jan 12, 2026, 39-40°F bracket
+- `KXHIGHNY-26JAN12-T46` → Jan 12, 2026, >46°F bracket
 
-## 5. Execution Strategy (The Gas War)
-On Base (EIP-1559), speed is determined by the **Priority Fee**.
-*   **Standard Tx:** `MaxFeePerGas = BaseFee + PriorityFee`.
-*   **Atlas Tx:** `MaxFeePerGas = (BaseFee * 1.2) + (PriorityFee * 2.0)`.
-*   *Goal:* We must pay a premium to be included in the very next block, ahead of other arb bots.
+## 4. Technical Architecture
 
-## 6. Implementation Roadmap
+### 4.1 Data Sources
+| Source | API Endpoint | Cost | Purpose |
+|--------|--------------|------|---------|
+| Open-Meteo GFS | `api.open-meteo.com/v1/forecast` | Free | GFS forecasts |
+| Open-Meteo ECMWF | `api.open-meteo.com/v1/ecmwf` | Free | ECMWF forecasts |
+| Kalshi API | `trading-api.kalshi.com` | Free | Market data & trading |
 
-### Phase 1: The "Paper Sniper" (Data Collection)
-*   **Goal:** Verify the lag exists without spending funds.
-*   **Output:** A CSV log: `Timestamp | Binance_Price | Limitless_Best_Ask | Theoretical_Profit`.
-*   **Requirement:** Use `web3.py` to read the contract state, do not rely on UI APIs.
+### 4.2 File Structure
+```
+limitless/
+├── weather_bot.py      # Main trading bot
+├── weather_client.py   # Open-Meteo API wrapper
+├── kalshi_client.py    # Kalshi API wrapper
+├── alerts.py           # Discord notifications
+├── .env                # API credentials
+└── weather_paper_trades.jsonl  # Paper trade log
+```
 
-### Phase 2: The "Hello World" (Small Cap)
-*   **Goal:** Execute the first live trade.
-*   **Limits:** Trade Size = $10.00 USDC.
-*   **Safety:** Stop trading if 3 consecutive failures (Reverts/Losses).
+### 4.3 Authentication
+Kalshi uses RSA-PSS signatures:
+- Private key: `kalshi_private_key.pem`
+- API Key ID: In `.env` as `KALSHI_API_KEY_ID`
 
-### Phase 3: Production (Loop)
-*   **Goal:** 24/7 Automation.
-*   **Upgrade:** Dockerize the bot. Implement "Balance Checks" to auto-stop if ETH for gas runs low.
+## 5. Entry Criteria
 
-## 7. Developer Instructions (Prompts)
-*   **Code Style:** Modular Python. Separate `strategy.py`, `execution.py`, and `config.py`.
-*   **Error Handling:** Wrap all RPC calls in `try/except` blocks. If RPC fails, log it and continue (do not crash).
-*   **ABIs:** If the Limitless ABI is not provided, instruct me on how to fetch it from BaseScan using the contract address.
+All conditions must be true:
+```
+├── GFS and ECMWF agree within 2°F
+├── Model bracket ≠ Market favorite bracket
+├── Edge > 20% (model_confidence - market_price)
+├── Time to settlement > 6 hours
+└── Market has liquidity
+```
 
-***
+## 6. Position Sizing & Risk
 
-### How to use this file:
-1.  **Save** the text above into a file named `claude.md` (or `project_plan.md`) in your project folder.
-2.  **Start a chat** with Claude (or ChatGPT o1/4o).
-3.  **Attach** the file (or paste the text).
-4.  **Type this prompt:**
-    > "I am building this arbitrage bot. Read the attached `claude.md` for the full context, math, and strategy. Start by helping me write the Python script for **Phase 1 (The Paper Sniper)**. Ensure you use `ccxt` for Binance and `web3.py` for Base."
+```
+├── Max $25 per trade
+├── Max 1 position per day per city
+├── Stop trading if 3 consecutive losses
+├── Scale up after 10 winning trades
+└── Never risk >5% of bankroll per trade
+```
+
+## 7. Expected Performance
+
+```
+Per Trade:
+├── Win Rate: 75-85%
+├── Avg Win: ~10x (buy at 10c, win $1)
+├── Avg Loss: -$25 max
+├── Expected Value: +$0.60-0.70 per contract
+
+Monthly (20 trades @ $25):
+├── Wins: ~16 trades × $22.50 = +$360
+├── Losses: ~4 trades × $25 = -$100
+├── Net: ~+$260/month
+├── ROI: ~50% monthly
+```
+
+## 8. Developer Instructions
+
+### 8.1 Running the Bot
+```bash
+# Paper trading (default)
+python3 weather_bot.py
+
+# Single scan
+python3 weather_bot.py --once
+
+# Live trading (requires funded account)
+python3 weather_bot.py --live
+```
+
+### 8.2 Key Functions
+
+**weather_client.py:**
+- `get_gfs_forecast()` - Fetch GFS model data
+- `get_ecmwf_forecast()` - Fetch ECMWF model data
+- `get_model_consensus()` - Check if models agree
+
+**weather_bot.py:**
+- `scan_once()` - Single scan for opportunities
+- `_check_opportunity()` - Evaluate a specific market
+- `_paper_trade()` - Record paper trade
+- `_execute_trade()` - Place live order
+
+**kalshi_client.py:**
+- `get_markets(series_ticker="KXHIGHNY")` - Get weather markets
+- `place_order()` - Execute trade
+- `get_balance()` - Check account balance
+
+### 8.3 Code Style
+- Async Python (asyncio/aiohttp)
+- Type hints where helpful
+- Modular design (separate clients)
+- Error handling with graceful degradation
+
+### 8.4 Testing Changes
+```bash
+# Test weather API
+python3 weather_client.py
+
+# Test single scan
+python3 weather_bot.py --once
+
+# Check paper trades
+cat weather_paper_trades.jsonl
+```
+
+## 9. Improvement Ideas
+
+### High Priority
+- [ ] Add HRRR model for same-day trades (more frequent updates)
+- [ ] Track actual settlement temps for win rate validation
+- [ ] Add boundary detection (avoid temps near bracket edges)
+
+### Medium Priority
+- [ ] Expand to other cities (Chicago, LA, Miami)
+- [ ] Add precipitation markets
+- [ ] Historical backtest with NWS data
+
+### Low Priority
+- [ ] Web dashboard for monitoring
+- [ ] SMS alerts for opportunities
+- [ ] Multi-account support
+
+## 10. Important Constraints
+
+1. **Legal:** Only trade on Kalshi (CFTC-regulated). Avoid Polymarket (blocked for US).
+
+2. **Timing:** Don't trade within 6 hours of settlement (models less reliable).
+
+3. **Liquidity:** Skip markets with no bids (can't execute).
+
+4. **Edge Threshold:** Minimum 20% edge required. Don't chase small edges.
+
+5. **Model Agreement:** Only trade when GFS and ECMWF agree within 2°F.
+
+## 11. Quick Reference
+
+### API Endpoints
+```
+GFS:   https://api.open-meteo.com/v1/forecast?latitude=40.7829&longitude=-73.9654&daily=temperature_2m_max&temperature_unit=fahrenheit
+ECMWF: https://api.open-meteo.com/v1/ecmwf?latitude=40.7829&longitude=-73.9654&daily=temperature_2m_max&temperature_unit=fahrenheit
+```
+
+### Kalshi Series
+- `KXHIGHNY` - NYC High Temperature
+- `KXHIGHCHI` - Chicago High Temperature (future)
+- `KXHIGHLA` - LA High Temperature (future)
+
+### Settlement Source
+NWS CLI Report: https://forecast.weather.gov/product.php?site=OKX&product=CLI&issuedby=NYC

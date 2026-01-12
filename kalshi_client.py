@@ -87,16 +87,18 @@ class KalshiClient:
         timestamp_ms = int(time.time() * 1000)
         timestamp_str = str(timestamp_ms)
 
-        # Message to sign: timestamp + method + path (without query params)
+        # Message to sign: timestamp + method + full_path (without query params)
+        # Path should include /trade-api/v2 prefix
         path_without_query = path.split("?")[0]
-        message = f"{timestamp_str}{method}{path_without_query}"
+        full_path = f"/trade-api/v2{path_without_query}"
+        message = f"{timestamp_str}{method}{full_path}"
 
-        # Sign with RSA-PSS
+        # Sign with RSA-PSS (salt_length must be DIGEST_LENGTH per Kalshi spec)
         signature = self.private_key.sign(
             message.encode("utf-8"),
             padding.PSS(
                 mgf=padding.MGF1(hashes.SHA256()),
-                salt_length=padding.PSS.MAX_LENGTH,
+                salt_length=padding.PSS.DIGEST_LENGTH,
             ),
             hashes.SHA256(),
         )
@@ -104,10 +106,10 @@ class KalshiClient:
         signature_b64 = base64.b64encode(signature).decode("utf-8")
 
         return {
+            "Content-Type": "application/json",
             "KALSHI-ACCESS-KEY": self.api_key_id,
             "KALSHI-ACCESS-SIGNATURE": signature_b64,
             "KALSHI-ACCESS-TIMESTAMP": timestamp_str,
-            "Content-Type": "application/json",
         }
 
     async def _request(
@@ -194,11 +196,17 @@ class KalshiClient:
 
     async def get_btc_markets(self) -> list:
         """Get all open BTC price prediction markets."""
-        # Kalshi BTC markets use series ticker 'KXBTC' or similar
-        markets = await self.get_markets(limit=200)
+        # First try direct series filter for efficiency
+        markets = await self.get_markets(series_ticker="KXBTC", limit=200)
+
+        if markets:
+            return markets
+
+        # Fallback: get all markets and filter by title/ticker
+        all_markets = await self.get_markets(limit=200)
 
         btc_markets = []
-        for m in markets:
+        for m in all_markets:
             title = m.get("title", "").upper()
             ticker = m.get("ticker", "").upper()
 
@@ -304,11 +312,17 @@ class KalshiClient:
         """
         Parse market data into standardized format.
 
+        Kalshi BTC markets have three types:
+        - "greater": BTC > floor_strike (T markets)
+        - "less": BTC < cap_strike (T markets)
+        - "between": floor_strike < BTC < cap_strike (B markets)
+
         Returns:
             {
                 "ticker": str,
                 "title": str,
                 "strike": float,
+                "strike_type": str,  # "greater", "less", "between"
                 "expiry_ts": float,
                 "yes_price": float,
                 "no_price": float,
@@ -316,15 +330,30 @@ class KalshiClient:
             }
         """
         title = market.get("title", "")
+        strike_type = market.get("strike_type", "")
 
-        # Get strike from floor_strike field (proper API field)
-        strike = float(market.get("floor_strike", 0))
+        # Get strike based on market type
+        if strike_type == "greater":
+            # BTC > floor_strike (YES wins if price above)
+            strike = float(market.get("floor_strike", 0) or 0)
+        elif strike_type == "less":
+            # BTC < cap_strike (YES wins if price below)
+            strike = float(market.get("cap_strike", 0) or 0)
+        elif strike_type == "between":
+            # Range market - use floor_strike as lower bound
+            strike = float(market.get("floor_strike", 0) or 0)
+        else:
+            # Fallback: try both fields
+            strike = float(market.get("floor_strike", 0) or market.get("cap_strike", 0) or 0)
 
-        # Fallback: extract from title if floor_strike not available
+        # Fallback: extract from ticker (e.g., B92000 = $92,000)
         if strike == 0:
+            ticker = market.get("ticker", "")
             import re
-            strike_match = re.search(r"\$?([\d,]+)", title)
-            strike = float(strike_match.group(1).replace(",", "")) if strike_match else 0
+            # Match patterns like B92000, T99999.99
+            match = re.search(r"[BT](\d+(?:\.\d+)?)", ticker)
+            if match:
+                strike = float(match.group(1))
 
         # Parse expiry from close_time or expiration_time
         expiry_str = market.get("expiration_time", market.get("close_time", ""))
@@ -334,11 +363,11 @@ class KalshiClient:
         except:
             expiry_ts = 0
 
-        # Get prices - try both cents and dollars fields
-        yes_price = market.get("yes_bid", 0)
-        no_price = market.get("no_bid", 0)
+        # Get prices - Kalshi uses cents (0-100 scale)
+        yes_price = market.get("yes_bid", 0) or 0
+        no_price = market.get("no_bid", 0) or 0
 
-        # If values are > 1, they're in cents (0-100 scale)
+        # Convert from cents to decimal
         if yes_price > 1:
             yes_price = yes_price / 100.0
         if no_price > 1:
@@ -346,17 +375,21 @@ class KalshiClient:
 
         # Use ask prices if bids are 0
         if yes_price == 0:
-            yes_price = market.get("yes_ask", 50)
-            if yes_price > 1:
-                yes_price = yes_price / 100.0
+            yes_ask = market.get("yes_ask", 0) or 0
+            if yes_ask > 1:
+                yes_price = yes_ask / 100.0
+            else:
+                yes_price = yes_ask
         if no_price == 0:
-            no_price = market.get("no_ask", 50)
-            if no_price > 1:
-                no_price = no_price / 100.0
+            no_ask = market.get("no_ask", 0) or 0
+            if no_ask > 1:
+                no_price = no_ask / 100.0
+            else:
+                no_price = no_ask
 
         # Last resort: use last_price
         if yes_price == 0 and no_price == 0:
-            last = market.get("last_price", 50)
+            last = market.get("last_price", 50) or 50
             if last > 1:
                 last = last / 100.0
             yes_price = last
@@ -366,6 +399,7 @@ class KalshiClient:
             "ticker": market.get("ticker", ""),
             "title": title,
             "strike": strike,
+            "strike_type": strike_type,
             "expiry_ts": expiry_ts,
             "expiry_str": expiry_str,
             "yes_price": yes_price,
