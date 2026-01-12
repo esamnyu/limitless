@@ -37,14 +37,26 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 
+from pathlib import Path
+
 import aiohttp
 import ccxt.pro as ccxtpro
 import socketio
 from dotenv import load_dotenv
 from eth_account import Account
 from eth_account.messages import encode_typed_data
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from web3 import AsyncWeb3
+from web3.providers import AsyncHTTPProvider
 
 from gas_optimizer import GasOptimizer
+
+# USDC on Base mainnet
+USDC_ADDRESS = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+USDC_ABI = [{"constant": True, "inputs": [{"name": "_owner", "type": "address"}], "name": "balanceOf", "outputs": [{"name": "balance", "type": "uint256"}], "type": "function"}]
+
+# Kill switch file path
+KILL_SWITCH_PATH = Path("/tmp/atlas_stop")
 
 load_dotenv()
 
@@ -157,15 +169,27 @@ class Atlas:
         self.trades: list[Trade] = []
         self.consecutive_losses = 0
         self.halted = False
+        self.halt_reason = ""
+
+        # Circuit breaker
+        self.starting_balance = 0.0
+        self.max_drawdown_pct = 0.20  # Halt if down 20%
+
+        # Nonce management (for rapid txs)
+        self.current_nonce: Optional[int] = None
 
         # Components
         self.gas: Optional[GasOptimizer] = None
         self.session: Optional[aiohttp.ClientSession] = None
+        self.web3: Optional[AsyncWeb3] = None
 
         # Authentication
         self.wallet_address = ""
         self.authenticated = False
         self.usdc_balance = 0.0
+
+        # Discord webhook for alerts (optional)
+        self.discord_webhook = os.getenv("DISCORD_WEBHOOK", "")
 
         # Stats
         self.signals_detected = 0
@@ -180,6 +204,12 @@ class Atlas:
     async def start(self):
         """Initialize and start the bot."""
         self._print_banner()
+
+        # Check kill switch at startup
+        if self._check_kill_switch():
+            print("[HALT] Kill switch active (/tmp/atlas_stop exists)")
+            print("  Remove the file to start: rm /tmp/atlas_stop")
+            return
 
         # Validate
         if self.live_mode and not self.private_key:
@@ -197,6 +227,14 @@ class Atlas:
                 print(f"[ERROR] Invalid private key: {e}")
                 return
 
+        # Initialize web3 for on-chain queries
+        self.web3 = AsyncWeb3(AsyncHTTPProvider(self.rpc_url))
+        try:
+            chain_id = await self.web3.eth.chain_id
+            print(f"[INIT] Connected to chain {chain_id}")
+        except Exception as e:
+            print(f"[WARN] Web3 connection issue: {e}")
+
         # HTTP session
         self.session = aiohttp.ClientSession(headers={
             "User-Agent": "Atlas/1.0",
@@ -209,11 +247,21 @@ class Atlas:
             if await self._authenticate():
                 print("[INIT] Authenticated with Limitless")
                 balance = await self._check_balance()
+                if balance <= 0:
+                    print(f"[ERROR] Could not verify USDC balance (got ${balance:.2f})")
+                    print("  Refusing to trade with unverified balance")
+                    return
                 if balance < self.position_size:
                     print(f"[ERROR] Insufficient USDC balance: ${balance:.2f}")
                     print(f"  Need at least ${self.position_size} USDC on Base")
                     return
                 print(f"[INIT] USDC Balance: ${balance:.2f}")
+                # Record starting balance for circuit breaker
+                self.starting_balance = balance
+                # Initialize nonce
+                if self.wallet_address:
+                    self.current_nonce = await self.web3.eth.get_transaction_count(self.wallet_address)
+                    print(f"[INIT] Starting nonce: {self.current_nonce}")
             else:
                 print("[ERROR] Authentication failed")
                 return
@@ -306,60 +354,54 @@ class Atlas:
         print("[SCAN] Discovering markets...")
 
         try:
-            async with self.session.get(
-                f"{self.api_url}/markets/active?limit=25"
-            ) as resp:
-                if resp.status != 200:
-                    return
+            data = await self._fetch_json(f"{self.api_url}/markets/active?limit=25")
+            now_ms = time.time() * 1000
 
-                data = await resp.json()
-                now_ms = time.time() * 1000
+            for m in data.get("data", []):
+                title = m.get("title", "")
+                slug = m.get("slug", "")
+                exp_ts = m.get("expirationTimestamp", 0)
 
-                for m in data.get("data", []):
-                    title = m.get("title", "")
-                    slug = m.get("slug", "")
-                    exp_ts = m.get("expirationTimestamp", 0)
+                # Determine asset type
+                asset = None
+                if "BTC" in title or "Bitcoin" in title:
+                    asset = "BTC"
+                elif "ETH" in title or "Ethereum" in title:
+                    asset = "ETH"
+                elif "SOL" in title or "Solana" in title:
+                    asset = "SOL"
 
-                    # Determine asset type
-                    asset = None
-                    if "BTC" in title or "Bitcoin" in title:
-                        asset = "BTC"
-                    elif "ETH" in title or "Ethereum" in title:
-                        asset = "ETH"
-                    elif "SOL" in title or "Solana" in title:
-                        asset = "SOL"
+                if not asset:
+                    continue
+                if exp_ts < now_ms + 900000:  # 15 min minimum
+                    continue
+                if slug in self.markets:  # Already tracking
+                    continue
 
-                    if not asset:
-                        continue
-                    if exp_ts < now_ms + 900000:  # 15 min minimum
-                        continue
-                    if slug in self.markets:  # Already tracking
-                        continue
+                match = re.search(r"\$?([\d,]+\.?\d*)", title)
+                if not match:
+                    continue
 
-                    match = re.search(r"\$?([\d,]+\.?\d*)", title)
-                    if not match:
-                        continue
+                prices = m.get("prices", [0, 0])
+                tokens = m.get("tokens", {})
+                venue = m.get("venue", {})
 
-                    prices = m.get("prices", [0, 0])
-                    tokens = m.get("tokens", {})
-                    venue = m.get("venue", {})
-
-                    market = Market(
-                        slug=slug,
-                        title=title,
-                        strike=float(match.group(1).replace(",", "")),
-                        expiry_ts=exp_ts / 1000,
-                        asset=asset,
-                        no_price=float(prices[0]) if prices else 0,
-                        yes_price=float(prices[1]) if len(prices) > 1 else 0,
-                        updated_at=time.time(),
-                        yes_token_id=str(tokens.get("yes", "")),
-                        no_token_id=str(tokens.get("no", "")),
-                        venue_address=venue.get("exchange", "") if isinstance(venue, dict) else "",
-                    )
-                    self.markets[slug] = market
-                    print(f"  [+] {asset} ${market.strike:,.0f} | {market.ttl_min:.0f}min | "
-                          f"YES:{market.yes_price:.0%} NO:{market.no_price:.0%}")
+                market = Market(
+                    slug=slug,
+                    title=title,
+                    strike=float(match.group(1).replace(",", "")),
+                    expiry_ts=exp_ts / 1000,
+                    asset=asset,
+                    no_price=float(prices[0]) if prices else 0,
+                    yes_price=float(prices[1]) if len(prices) > 1 else 0,
+                    updated_at=time.time(),
+                    yes_token_id=str(tokens.get("yes", "")),
+                    no_token_id=str(tokens.get("no", "")),
+                    venue_address=venue.get("exchange", "") if isinstance(venue, dict) else "",
+                )
+                self.markets[slug] = market
+                print(f"  [+] {asset} ${market.strike:,.0f} | {market.ttl_min:.0f}min | "
+                      f"YES:{market.yes_price:.0%} NO:{market.no_price:.0%}")
 
         except Exception as e:
             print(f"[ERROR] Discovery failed: {e}")
@@ -504,25 +546,61 @@ class Atlas:
             print(f"[AUTH ERROR] {e}")
             return False
 
+    def _check_kill_switch(self) -> bool:
+        """Check if kill switch file exists."""
+        return KILL_SWITCH_PATH.exists()
+
     async def _check_balance(self) -> float:
-        """Check USDC balance on Limitless."""
+        """
+        Check USDC balance. Tries API first, falls back to on-chain.
+        NEVER returns a fake balance - returns 0.0 if both methods fail.
+        """
+        # Method 1: Try Limitless API
         try:
             async with self.session.get(
                 f"{self.api_url}/portfolio/positions"
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    # Try to find USDC balance
-                    self.usdc_balance = float(data.get("availableBalance", 0))
-                    return self.usdc_balance
-
-            # Fallback: check on-chain balance
-            # For now return a placeholder
-            return 100.0  # Assume $100 for testing
-
+                    balance = float(data.get("availableBalance", 0))
+                    if balance > 0:
+                        self.usdc_balance = balance
+                        return balance
         except Exception as e:
-            print(f"[BALANCE ERROR] {e}")
-            return 0.0
+            print(f"[BALANCE] API check failed: {e}")
+
+        # Method 2: Query on-chain USDC balance
+        if self.web3 and self.wallet_address:
+            try:
+                usdc = self.web3.eth.contract(
+                    address=self.web3.to_checksum_address(USDC_ADDRESS),
+                    abi=USDC_ABI
+                )
+                raw_balance = await usdc.functions.balanceOf(self.wallet_address).call()
+                # USDC has 6 decimals
+                balance = raw_balance / 1e6
+                if balance > 0:
+                    print(f"[BALANCE] On-chain USDC: ${balance:.2f}")
+                    self.usdc_balance = balance
+                    return balance
+            except Exception as e:
+                print(f"[BALANCE] On-chain check failed: {e}")
+
+        # CRITICAL: Never return fake balance - return 0 to halt trading
+        print("[BALANCE] Could not verify balance - returning 0 for safety")
+        return 0.0
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        retry=retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError)),
+        reraise=True,
+    )
+    async def _fetch_json(self, url: str) -> dict:
+        """Fetch JSON with retry logic."""
+        async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            resp.raise_for_status()
+            return await resp.json()
 
     async def _submit_order(self, signal: Signal) -> Optional[str]:
         """Submit order to Limitless API."""
@@ -661,6 +739,7 @@ class Atlas:
             asyncio.create_task(self._cex_stream()),
             asyncio.create_task(self._status_display()),
             asyncio.create_task(self._market_refresher()),
+            asyncio.create_task(self._kill_switch_monitor()),  # Safety monitor
         ]
 
         # Always run a fast backup poller (checks staleness)
@@ -678,6 +757,17 @@ class Atlas:
             pass
         finally:
             await self.stop()
+
+    async def _kill_switch_monitor(self):
+        """Monitor for kill switch file - check every 5 seconds."""
+        while self.running:
+            if self._check_kill_switch():
+                print("\n[KILL SWITCH] /tmp/atlas_stop detected - shutting down!")
+                self.halted = True
+                self.halt_reason = "Kill switch activated"
+                self.running = False
+                break
+            await asyncio.sleep(5)
 
     async def _cex_stream(self):
         """Stream CEX prices for BTC, ETH, SOL and detect velocity triggers."""
@@ -745,17 +835,13 @@ class Atlas:
                 # Only poll if data is stale (>2 seconds old)
                 if now - market.updated_at > 2.0:
                     try:
-                        async with self.session.get(
-                            f"{self.api_url}/markets/{slug}"
-                        ) as resp:
-                            if resp.status == 200:
-                                data = await resp.json()
-                                prices = data.get("prices", [0, 0])
-                                market.no_price = float(prices[0])
-                                market.yes_price = float(prices[1]) if len(prices) > 1 else 0
-                                market.updated_at = time.time()
+                        data = await self._fetch_json(f"{self.api_url}/markets/{slug}")
+                        prices = data.get("prices", [0, 0])
+                        market.no_price = float(prices[0])
+                        market.yes_price = float(prices[1]) if len(prices) > 1 else 0
+                        market.updated_at = time.time()
                     except Exception:
-                        pass
+                        pass  # Retry logic already in _fetch_json
 
             await asyncio.sleep(0.5)  # Fast polling: 500ms
 
@@ -782,9 +868,17 @@ class Atlas:
                     await self._subscribe_new_market(slug)
 
     async def _status_display(self):
-        """Display status periodically."""
+        """Display status periodically and update heartbeat."""
+        heartbeat_path = Path("/tmp/atlas_heartbeat")
+
         while self.running:
             await asyncio.sleep(15)
+
+            # Update heartbeat file (external monitors can check this)
+            try:
+                heartbeat_path.touch()
+            except Exception:
+                pass
 
             if self.gas and any(p > 0 for p in self.cex_prices.values()):
                 gas_status = self.gas.get_status()
@@ -981,6 +1075,17 @@ class Atlas:
     async def _execute(self, signal: Signal):
         """Execute trade on signal."""
         print("[EXECUTE] Placing order...")
+
+        # Circuit breaker: Check drawdown
+        if self.starting_balance > 0:
+            current = await self._check_balance()
+            drawdown = (self.starting_balance - current) / self.starting_balance
+            if drawdown >= self.max_drawdown_pct:
+                print(f"\n[CIRCUIT BREAKER] Drawdown {drawdown:.1%} exceeds limit {self.max_drawdown_pct:.0%}!")
+                print(f"  Started: ${self.starting_balance:.2f} | Current: ${current:.2f}")
+                self.halted = True
+                self.halt_reason = f"Circuit breaker: {drawdown:.1%} drawdown"
+                return
 
         # Check balance first
         if self.usdc_balance < self.position_size:
