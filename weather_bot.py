@@ -176,6 +176,9 @@ class WeatherBot:
         self.opportunities_found = 0
         self.trades_executed = 0
 
+        # Track tickers we've already traded (prevent duplicates)
+        self.traded_tickers: set[str] = set()
+
     async def start(self):
         """Initialize and start the bot."""
         self._print_banner()
@@ -527,6 +530,11 @@ class WeatherBot:
 
     async def _handle_opportunity(self, opp: WeatherOpportunity):
         """Handle a discovered opportunity."""
+        # Skip if we've already traded this ticker
+        if opp.ticker in self.traded_tickers:
+            print(f"[SKIP] Already traded {opp.ticker}")
+            return
+
         print(f"\n{'='*70}")
         print(f"[OPPORTUNITY #{self.opportunities_found}] {opp.date}")
         print(f"{'='*70}")
@@ -580,6 +588,7 @@ class WeatherBot:
             )
 
             self.trades_executed += 1
+            self.traded_tickers.add(opp.ticker)  # Mark as traded
             print(f"  [SUCCESS] Bought {contracts} YES @ {opp.market_yes_price:.0%}")
             print(f"  Order ID: {result.get('order', {}).get('order_id', 'N/A')}")
 
@@ -601,6 +610,7 @@ class WeatherBot:
         )
 
         self.paper_trades.append(trade)
+        self.traded_tickers.add(opp.ticker)  # Mark as traded
         self._log_trade(opp, contracts, is_paper=True)
 
         max_profit = contracts * (1 - opp.market_yes_price)
@@ -640,11 +650,20 @@ class WeatherBot:
             }) + "\n")
 
     def _load_paper_trades(self):
-        """Load existing paper trades from log."""
+        """Load existing paper trades from log and populate traded tickers."""
         if PAPER_TRADES_LOG.exists():
             with open(PAPER_TRADES_LOG) as f:
                 lines = f.readlines()
+                for line in lines:
+                    try:
+                        trade = json.loads(line.strip())
+                        ticker = trade.get("ticker", "")
+                        if ticker:
+                            self.traded_tickers.add(ticker)
+                    except:
+                        continue
                 print(f"[PAPER] Loaded {len(lines)} historical paper trades")
+                print(f"[PAPER] Tracking {len(self.traded_tickers)} traded tickers")
 
     def _save_paper_trades(self):
         """Save paper trade results."""
@@ -783,18 +802,97 @@ class WeatherBot:
         else:
             print(f"[SETTLEMENT] No trades to settle for {report_date}")
 
-    async def run_loop(self, interval: int = 1800):
-        """Run continuous scanning loop. Default: 30 minutes."""
+    # Optimal scan times (ET) - aligned with model updates and market activity
+    # 06:00 - Overnight model runs (00Z GFS/ECMWF processed)
+    # 10:00 - Market opens, new contracts listed
+    # 12:00 - Midday check (06Z models processed)
+    # 18:00 - Evening model run (12Z processed)
+    # 22:00 - Night check (18Z processed)
+    SCAN_TIMES = ["06:00", "10:00", "12:00", "18:00", "22:00"]
+
+    def _get_next_scan_time(self) -> tuple[datetime, str]:
+        """
+        Calculate the next scheduled scan time.
+
+        Returns:
+            Tuple of (next_scan_datetime, scan_time_str)
+        """
+        from zoneinfo import ZoneInfo
+
+        et = ZoneInfo("America/New_York")
+        now = datetime.now(et)
+        today = now.date()
+
+        for time_str in self.SCAN_TIMES:
+            hour, minute = map(int, time_str.split(":"))
+            scan_dt = datetime(today.year, today.month, today.day, hour, minute, tzinfo=et)
+
+            if scan_dt > now:
+                return scan_dt, time_str
+
+        # All today's times passed - schedule for tomorrow's first time
+        tomorrow = today + timedelta(days=1)
+        hour, minute = map(int, self.SCAN_TIMES[0].split(":"))
+        scan_dt = datetime(tomorrow.year, tomorrow.month, tomorrow.day, hour, minute, tzinfo=et)
+        return scan_dt, self.SCAN_TIMES[0]
+
+    async def run_loop(self, interval: int = None):
+        """
+        Run scheduled scanning loop.
+
+        Scans at optimal times aligned with model updates:
+        - 06:00 ET: Overnight models (00Z)
+        - 10:00 ET: Market open
+        - 12:00 ET: Midday (06Z models)
+        - 18:00 ET: Evening (12Z models)
+        - 22:00 ET: Night (18Z models)
+
+        Args:
+            interval: If provided, use fixed interval (seconds) instead of schedule.
+                     For backwards compatibility.
+        """
+        from zoneinfo import ZoneInfo
+        et = ZoneInfo("America/New_York")
+
+        # If interval provided, use old behavior
+        if interval:
+            while self.running:
+                try:
+                    await self.scan_once()
+                    print(f"\n[WAIT] Next scan in {interval//60} minutes...")
+                    await asyncio.sleep(interval)
+                except KeyboardInterrupt:
+                    break
+                except Exception as e:
+                    print(f"[ERROR] Scan failed: {e}")
+                    await asyncio.sleep(60)
+            await self.stop()
+            return
+
+        # Schedule-based scanning
+        print(f"\n[SCHEDULE] Scan times (ET): {', '.join(self.SCAN_TIMES)}")
+
         while self.running:
             try:
+                # Run immediate scan on startup
                 await self.scan_once()
-                print(f"\n[WAIT] Next scan in {interval//60} minutes...")
-                await asyncio.sleep(interval)
+
+                # Calculate wait until next scheduled time
+                next_scan, next_time = self._get_next_scan_time()
+                now = datetime.now(et)
+                wait_seconds = (next_scan - now).total_seconds()
+
+                if wait_seconds > 0:
+                    hours = int(wait_seconds // 3600)
+                    minutes = int((wait_seconds % 3600) // 60)
+                    print(f"\n[SCHEDULE] Next scan at {next_time} ET ({hours}h {minutes}m)")
+                    await asyncio.sleep(wait_seconds)
+
             except KeyboardInterrupt:
                 break
             except Exception as e:
                 print(f"[ERROR] Scan failed: {e}")
-                await asyncio.sleep(60)
+                await asyncio.sleep(300)  # Wait 5 min on error
 
         await self.stop()
 
@@ -816,6 +914,12 @@ async def main():
         action="store_true",
         help="Check NWS for settlements and exit",
     )
+    parser.add_argument(
+        "--interval",
+        type=int,
+        default=None,
+        help="Override schedule with fixed interval in minutes (e.g., --interval 30)",
+    )
     args = parser.parse_args()
 
     bot = WeatherBot(live_mode=args.live)
@@ -829,7 +933,9 @@ async def main():
         await bot.scan_once()
         await bot.stop()
     else:
-        await bot.run_loop()
+        # Convert minutes to seconds if interval provided
+        interval_sec = args.interval * 60 if args.interval else None
+        await bot.run_loop(interval=interval_sec)
 
 
 if __name__ == "__main__":
