@@ -642,7 +642,6 @@ class WeatherBot:
     def _load_paper_trades(self):
         """Load existing paper trades from log."""
         if PAPER_TRADES_LOG.exists():
-            # Count existing trades
             with open(PAPER_TRADES_LOG) as f:
                 lines = f.readlines()
                 print(f"[PAPER] Loaded {len(lines)} historical paper trades")
@@ -650,6 +649,139 @@ class WeatherBot:
     def _save_paper_trades(self):
         """Save paper trade results."""
         pass  # Already logged in real-time
+
+    # -------------------------------------------------------------------------
+    # SETTLEMENT TRACKING
+    # -------------------------------------------------------------------------
+
+    async def check_settlements(self):
+        """
+        Check NWS for actual temps and settle pending paper trades.
+
+        This should be called each morning after NWS publishes the CLI report
+        (typically around 7-8 AM ET).
+        """
+        print("\n[SETTLEMENT] Checking for settled trades...")
+
+        # Get actual temp from NWS
+        nws_data = await self.weather.get_nws_actual_temp()
+
+        if not nws_data:
+            print("[SETTLEMENT] Could not fetch NWS data")
+            return
+
+        report_date = nws_data["date"]
+        actual_temp = nws_data["high_temp"]
+        actual_bracket = self.weather.temp_to_bracket(actual_temp)
+
+        print(f"[SETTLEMENT] NWS Report for {report_date}:")
+        print(f"  Actual high: {actual_temp}°F")
+        print(f"  Actual bracket: {actual_bracket}")
+
+        # Load paper trades and find unsettled ones for this date
+        if not PAPER_TRADES_LOG.exists():
+            print("[SETTLEMENT] No paper trades to settle")
+            return
+
+        settled_count = 0
+        wins = 0
+        losses = 0
+        total_pnl = 0.0
+
+        # Read existing trades
+        trades = []
+        with open(PAPER_TRADES_LOG, "r") as f:
+            for line in f:
+                try:
+                    trade = json.loads(line.strip())
+                    trades.append(trade)
+                except:
+                    continue
+
+        # Check each trade
+        updated_trades = []
+        for trade in trades:
+            trade_date = trade.get("date", "")
+
+            # Skip if already settled
+            if trade.get("settled"):
+                updated_trades.append(trade)
+                continue
+
+            # Check if this trade is for the settled date
+            if trade_date == report_date:
+                predicted_bracket = trade.get("model_bracket", "")
+                contracts = trade.get("contracts", 0)
+                entry_price = trade.get("market_price", 0)
+
+                # Determine if won (predicted bracket matches actual)
+                # Normalize bracket strings for comparison
+                predicted_norm = predicted_bracket.replace("°F", "").replace(" ", "")
+                actual_norm = actual_bracket.replace("°F", "").replace(" ", "")
+
+                won = predicted_norm == actual_norm
+
+                # Calculate P&L
+                if won:
+                    pnl = contracts * (1 - entry_price)
+                    wins += 1
+                else:
+                    pnl = -contracts * entry_price
+                    losses += 1
+
+                total_pnl += pnl
+                settled_count += 1
+
+                # Update trade record
+                trade["settled"] = True
+                trade["actual_temp"] = actual_temp
+                trade["actual_bracket"] = actual_bracket
+                trade["won"] = won
+                trade["pnl"] = pnl
+                trade["settled_at"] = datetime.now(timezone.utc).isoformat()
+
+                # Print result
+                result = "WIN ✅" if won else "LOSS ❌"
+                print(f"\n[SETTLEMENT] Trade for {trade_date}: {result}")
+                print(f"  Predicted: {predicted_bracket}")
+                print(f"  Actual: {actual_bracket} ({actual_temp}°F)")
+                print(f"  P&L: ${pnl:+.2f}")
+
+                # Send Discord alert
+                await self.alerts.settlement_result(
+                    date=trade_date,
+                    predicted_bracket=predicted_bracket,
+                    actual_temp=actual_temp,
+                    actual_bracket=actual_bracket,
+                    won=won,
+                    pnl=pnl,
+                )
+
+                # Update running stats
+                if won:
+                    self.paper_wins += 1
+                else:
+                    self.paper_losses += 1
+                self.paper_pnl += pnl
+
+            updated_trades.append(trade)
+
+        # Rewrite trades file with settlement data
+        if settled_count > 0:
+            with open(PAPER_TRADES_LOG, "w") as f:
+                for trade in updated_trades:
+                    f.write(json.dumps(trade) + "\n")
+
+            print(f"\n[SETTLEMENT] Settled {settled_count} trades:")
+            print(f"  Wins: {wins}")
+            print(f"  Losses: {losses}")
+            print(f"  P&L: ${total_pnl:+.2f}")
+
+            # Check for milestones
+            total_settled = self.paper_wins + self.paper_losses
+            await self.alerts.milestone(total_settled, self.paper_wins, self.paper_losses)
+        else:
+            print(f"[SETTLEMENT] No trades to settle for {report_date}")
 
     async def run_loop(self, interval: int = 300):
         """Run continuous scanning loop."""
@@ -679,12 +811,21 @@ async def main():
         action="store_true",
         help="Run single scan and exit",
     )
+    parser.add_argument(
+        "--settle",
+        action="store_true",
+        help="Check NWS for settlements and exit",
+    )
     args = parser.parse_args()
 
     bot = WeatherBot(live_mode=args.live)
     await bot.start()
 
-    if args.once:
+    if args.settle:
+        # Just check settlements and exit
+        await bot.check_settlements()
+        await bot.stop()
+    elif args.once:
         await bot.scan_once()
         await bot.stop()
     else:

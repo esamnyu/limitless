@@ -281,6 +281,130 @@ class WeatherClient:
         }
 
 
+    # -------------------------------------------------------------------------
+    # NWS SETTLEMENT DATA
+    # -------------------------------------------------------------------------
+
+    async def get_nws_actual_temp(self, date: str = None) -> Optional[dict]:
+        """
+        Fetch actual high temperature from NWS CLI report.
+
+        The CLI (Climate Report) is issued each morning with yesterday's
+        actual high/low temps for Central Park, NYC.
+
+        Args:
+            date: Date to fetch (YYYY-MM-DD). Default: yesterday.
+
+        Returns:
+            {"date": str, "high_temp": float, "low_temp": float} or None
+        """
+        import re
+        from datetime import timedelta
+
+        url = "https://forecast.weather.gov/product.php?site=OKX&product=CLI&issuedby=NYC"
+
+        try:
+            async with self.session.get(url) as resp:
+                if resp.status != 200:
+                    print(f"[NWS] Failed to fetch CLI report: {resp.status}")
+                    return None
+
+                html = await resp.text()
+
+                # Extract the pre-formatted text content
+                pre_match = re.search(r'<pre[^>]*>(.*?)</pre>', html, re.DOTALL)
+                if not pre_match:
+                    print("[NWS] Could not find CLI data in response")
+                    return None
+
+                cli_text = pre_match.group(1)
+
+                # Parse the date from the report
+                # Format: "CLIMATE REPORT FOR JANUARY 11 2026"
+                date_match = re.search(
+                    r'CLIMATE REPORT\s+(?:FOR\s+)?(\w+)\s+(\d+)\s+(\d{4})',
+                    cli_text,
+                    re.IGNORECASE
+                )
+
+                if date_match:
+                    month_name = date_match.group(1).upper()
+                    day = int(date_match.group(2))
+                    year = int(date_match.group(3))
+
+                    months = {
+                        "JANUARY": 1, "FEBRUARY": 2, "MARCH": 3, "APRIL": 4,
+                        "MAY": 5, "JUNE": 6, "JULY": 7, "AUGUST": 8,
+                        "SEPTEMBER": 9, "OCTOBER": 10, "NOVEMBER": 11, "DECEMBER": 12
+                    }
+                    month = months.get(month_name, 1)
+                    report_date = f"{year}-{month:02d}-{day:02d}"
+                else:
+                    report_date = None
+
+                # Parse the high temperature
+                # Format: "MAXIMUM TEMPERATURE (F)       47" or similar
+                high_match = re.search(
+                    r'(?:MAXIMUM|MAX)\s+(?:TEMPERATURE)?\s*\(?F\)?\s+(\d+)',
+                    cli_text,
+                    re.IGNORECASE
+                )
+
+                if not high_match:
+                    # Alternative format: "TODAY...MAX  47  MIN  32"
+                    high_match = re.search(r'MAX\s+(\d+)', cli_text)
+
+                if not high_match:
+                    print("[NWS] Could not parse high temperature from CLI")
+                    return None
+
+                high_temp = int(high_match.group(1))
+
+                # Parse low temperature (optional)
+                low_match = re.search(
+                    r'(?:MINIMUM|MIN)\s+(?:TEMPERATURE)?\s*\(?F\)?\s+(\d+)',
+                    cli_text,
+                    re.IGNORECASE
+                )
+                low_temp = int(low_match.group(1)) if low_match else None
+
+                return {
+                    "date": report_date,
+                    "high_temp": float(high_temp),
+                    "low_temp": float(low_temp) if low_temp else None,
+                    "source": "NWS CLI NYC",
+                }
+
+        except Exception as e:
+            print(f"[NWS] Error fetching CLI report: {e}")
+            return None
+
+    def temp_to_bracket(self, temp: float, brackets: list[dict] = None) -> str:
+        """
+        Convert temperature to bracket name.
+
+        Args:
+            temp: Temperature in °F
+            brackets: Optional list of bracket definitions
+
+        Returns:
+            Bracket range string (e.g., "39-40°F")
+        """
+        # Default brackets (may not match actual market brackets)
+        if temp < 39:
+            return "<39°F"
+        elif temp < 41:
+            return "39-40°F"
+        elif temp < 43:
+            return "41-42°F"
+        elif temp < 45:
+            return "43-44°F"
+        elif temp < 47:
+            return "45-46°F"
+        else:
+            return ">46°F"
+
+
 async def test_client():
     """Test the weather client."""
     client = WeatherClient()
