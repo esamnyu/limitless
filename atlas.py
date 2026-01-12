@@ -50,6 +50,7 @@ from web3 import AsyncWeb3
 from web3.providers import AsyncHTTPProvider
 
 from gas_optimizer import GasOptimizer
+from alerts import AlertManager
 
 # USDC on Base mainnet
 USDC_ADDRESS = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
@@ -188,8 +189,8 @@ class Atlas:
         self.authenticated = False
         self.usdc_balance = 0.0
 
-        # Discord webhook for alerts (optional)
-        self.discord_webhook = os.getenv("DISCORD_WEBHOOK", "")
+        # Discord alerts
+        self.alerts = AlertManager()
 
         # Stats
         self.signals_detected = 0
@@ -289,11 +290,19 @@ class Atlas:
         print("\n[START] Atlas running. Press Ctrl+C to stop.\n")
         print("=" * 70)
 
+        # Send Discord alert
+        mode = "LIVE" if self.live_mode else "MONITOR"
+        await self.alerts.bot_started(len(self.markets), mode)
+
         await self._run()
 
     async def stop(self):
         """Graceful shutdown."""
         self.running = False
+
+        # Send Discord alert
+        reason = self.halt_reason if self.halt_reason else "Manual stop"
+        await self.alerts.bot_stopped(reason)
 
         # Disconnect WebSocket
         if self.ws_connected:
@@ -765,6 +774,7 @@ class Atlas:
                 print("\n[KILL SWITCH] /tmp/atlas_stop detected - shutting down!")
                 self.halted = True
                 self.halt_reason = "Kill switch activated"
+                await self.alerts.kill_switch()
                 self.running = False
                 break
             await asyncio.sleep(5)
@@ -1000,6 +1010,15 @@ class Atlas:
         print(f"  Edge: {best.edge:+.1%}")
         print(f"  Est. Profit: ${best.profit_est:+.2f}")
 
+        # Send Discord alert for signal
+        await self.alerts.signal_alert(
+            action=best.action,
+            asset=asset,
+            edge=best.edge,
+            profit_est=best.profit_est,
+            velocity=best.velocity,
+        )
+
         if self.monitor_only:
             print("[MONITOR] Would execute (monitor mode)")
             self._log_signal(best)
@@ -1085,6 +1104,7 @@ class Atlas:
                 print(f"  Started: ${self.starting_balance:.2f} | Current: ${current:.2f}")
                 self.halted = True
                 self.halt_reason = f"Circuit breaker: {drawdown:.1%} drawdown"
+                await self.alerts.circuit_breaker(drawdown, current)
                 return
 
         # Check balance first
