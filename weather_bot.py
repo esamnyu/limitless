@@ -215,11 +215,8 @@ class WeatherBot:
         print("[START] Weather trading bot running...")
         print("=" * 70)
 
-        await self.alerts.send(
-            "Weather Bot Started",
-            f"Mode: {mode}\nMin Edge: {self.MIN_EDGE:.0%}",
-            color=0x00FF00,
-        )
+        balance = await self.kalshi.get_balance() if self.kalshi else 0
+        await self.alerts.bot_started(mode, balance)
 
     async def stop(self):
         """Graceful shutdown."""
@@ -230,12 +227,10 @@ class WeatherBot:
         # Save paper trades
         self._save_paper_trades()
 
-        await self.alerts.send(
-            "Weather Bot Stopped",
-            f"Runtime: {runtime/60:.1f}min\n"
-            f"Opportunities: {self.opportunities_found}\n"
-            f"Paper P&L: ${self.paper_pnl:.2f}",
-            color=0xFF0000,
+        await self.alerts.bot_stopped(
+            runtime_min=runtime / 60,
+            trades=len(self.paper_trades),
+            paper_pnl=self.paper_pnl,
         )
 
         if self.weather:
@@ -549,20 +544,22 @@ class WeatherBot:
         print(f"{'='*70}")
 
         # Send alert
-        await self.alerts.send(
-            f"Weather Opportunity: {opp.date}",
-            f"Models: GFS={opp.gfs_temp:.1f}°F ECMWF={opp.ecmwf_temp:.1f}°F\n"
-            f"Bracket: {opp.model_bracket_range} @ {opp.market_yes_price:.0%}\n"
-            f"Edge: {opp.edge:.0%}\n"
-            f"Potential: {opp.potential_return:.1f}x",
-            color=0x00FF00,
+        await self.alerts.opportunity_found(
+            date=opp.date,
+            gfs_temp=opp.gfs_temp,
+            ecmwf_temp=opp.ecmwf_temp,
+            model_bracket=opp.model_bracket_range,
+            market_price=opp.market_yes_price,
+            market_favorite=opp.market_favorite,
+            edge=opp.edge,
+            potential_return=opp.potential_return + 1,
         )
 
         # Execute or paper trade
         if self.live_mode:
             await self._execute_trade(opp)
         elif self.paper_mode:
-            self._paper_trade(opp)
+            await self._paper_trade(opp)
 
     async def _execute_trade(self, opp: WeatherOpportunity):
         """Execute a live trade on Kalshi."""
@@ -592,7 +589,7 @@ class WeatherBot:
         except Exception as e:
             print(f"  [ERROR] Trade failed: {e}")
 
-    def _paper_trade(self, opp: WeatherOpportunity):
+    async def _paper_trade(self, opp: WeatherOpportunity):
         """Record a paper trade."""
         contracts = int(self.MAX_POSITION_SIZE / max(opp.market_yes_price, 0.01))
 
@@ -606,10 +603,23 @@ class WeatherBot:
         self.paper_trades.append(trade)
         self._log_trade(opp, contracts, is_paper=True)
 
+        max_profit = contracts * (1 - opp.market_yes_price)
+        max_loss = contracts * opp.market_yes_price
+
         print(f"\n[PAPER] Recorded paper trade:")
         print(f"  {contracts} contracts @ {opp.market_yes_price:.0%}")
-        print(f"  Max profit: ${contracts * (1 - opp.market_yes_price):.2f}")
-        print(f"  Max loss: ${contracts * opp.market_yes_price:.2f}")
+        print(f"  Max profit: ${max_profit:.2f}")
+        print(f"  Max loss: ${max_loss:.2f}")
+
+        # Send Discord alert
+        await self.alerts.paper_trade(
+            date=opp.date,
+            bracket=opp.model_bracket_range,
+            contracts=contracts,
+            entry_price=opp.market_yes_price,
+            max_profit=max_profit,
+            max_loss=max_loss,
+        )
 
     def _log_trade(self, opp: WeatherOpportunity, contracts: int, is_paper: bool):
         """Log trade to file."""
