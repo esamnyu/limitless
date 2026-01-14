@@ -242,7 +242,7 @@ cat weather_paper_trades.jsonl
 ### High Priority
 - [ ] Add HRRR model for same-day trades (more frequent updates)
 - [ ] Track actual settlement temps for win rate validation
-- [ ] Add boundary detection (avoid temps near bracket edges)
+- [x] Add boundary detection (avoid temps near bracket edges) - 1.5°F buffer
 
 ### Medium Priority
 - [ ] Expand to other cities (Chicago, LA, Miami)

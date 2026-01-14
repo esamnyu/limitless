@@ -66,6 +66,11 @@ class WeatherOpportunity:
 
     # Timing
     hours_to_settlement: float
+
+    # Boundary detection (fields with defaults must come last)
+    distance_to_boundary: float = 0.0  # °F distance to nearest bracket edge
+    bracket_min: float = 0.0  # Lower bound of bracket
+    bracket_max: float = 0.0  # Upper bound of bracket
     ts: float = field(default_factory=lambda: datetime.now(timezone.utc).timestamp())
 
     @property
@@ -82,7 +87,21 @@ class WeatherOpportunity:
             self.edge >= 0.20  # 20% minimum edge
             and self.hours_to_settlement >= 6  # Not too close to settlement
             and self.model_bracket != self.market_favorite  # Market disagrees
+            and self.distance_to_boundary >= 1.5  # Not too close to bracket edge
         )
+
+    @property
+    def skip_reason(self) -> str:
+        """Return reason why opportunity is not tradeable, or empty string if tradeable."""
+        if self.edge < 0.20:
+            return f"Edge too low ({self.edge:.0%} < 20%)"
+        if self.hours_to_settlement < 6:
+            return f"Too close to settlement ({self.hours_to_settlement:.1f}h < 6h)"
+        if self.model_bracket == self.market_favorite:
+            return "Model agrees with market favorite"
+        if self.distance_to_boundary < 1.5:
+            return f"Too close to bracket boundary ({self.distance_to_boundary:.1f}°F < 1.5°F)"
+        return ""
 
 
 @dataclass
@@ -148,6 +167,7 @@ class WeatherBot:
     MIN_HOURS_TO_SETTLEMENT = 6
     MAX_POSITION_SIZE = 25.0  # $25 max per trade
     MAX_DIVERGENCE = 2.0  # Max °F difference between models
+    BOUNDARY_BUFFER = 1.5  # Min °F distance from bracket boundary to trade
 
     def __init__(self, live_mode: bool = False):
         self.live_mode = live_mode
@@ -426,7 +446,8 @@ class WeatherBot:
                     self.opportunities_found += 1
                     await self._handle_opportunity(opp)
                 else:
-                    print(f"[SCAN] {date}: Opportunity found but not tradeable (edge={opp.edge:.0%})")
+                    print(f"[SCAN] {date}: Skipping - {opp.skip_reason}")
+                    print(f"       Temp={opp.model_avg:.1f}°F, Bracket={opp.model_bracket}, Boundary dist={opp.distance_to_boundary:.1f}°F")
 
         return opportunities
 
@@ -510,6 +531,21 @@ class WeatherBot:
         # Calculate edge
         edge = consensus["confidence"] - yes_price
 
+        # Calculate distance to nearest bracket boundary
+        bracket_min = target_bracket_info["min"]
+        bracket_max = target_bracket_info["max"]
+
+        # Handle infinite boundaries (for "above X" or "below X" brackets)
+        if bracket_min == float("-inf"):
+            distance_to_boundary = bracket_max - model_temp
+        elif bracket_max == float("inf"):
+            distance_to_boundary = model_temp - bracket_min
+        else:
+            # Distance to nearest edge
+            dist_to_min = model_temp - bracket_min
+            dist_to_max = bracket_max - model_temp
+            distance_to_boundary = min(dist_to_min, dist_to_max)
+
         # Create opportunity
         return WeatherOpportunity(
             date=consensus["date"],
@@ -525,6 +561,9 @@ class WeatherBot:
             market_favorite_price=favorite_price,
             edge=edge,
             expected_value=edge * (1.0 - yes_price) if yes_price < 1 else 0,
+            distance_to_boundary=distance_to_boundary,
+            bracket_min=bracket_min if bracket_min != float("-inf") else -999,
+            bracket_max=bracket_max if bracket_max != float("inf") else 999,
             hours_to_settlement=hours_to_settlement,
         )
 
@@ -541,6 +580,7 @@ class WeatherBot:
         print(f"  Models:     GFS={opp.gfs_temp:.1f}°F  ECMWF={opp.ecmwf_temp:.1f}°F")
         print(f"  Average:    {opp.model_avg:.1f}°F → {opp.model_bracket_range}")
         print(f"  Confidence: {opp.model_confidence:.0%}")
+        print(f"  Boundary:   {opp.distance_to_boundary:.1f}°F from edge (min {self.BOUNDARY_BUFFER}°F)")
         print(f"")
         print(f"  Market:     {opp.model_bracket_range} @ {opp.market_yes_price:.0%}")
         print(f"  Favorite:   {self.BRACKETS.get(opp.market_favorite, {}).get('range', '?')} @ {opp.market_favorite_price:.0%}")
