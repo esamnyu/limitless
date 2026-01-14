@@ -36,6 +36,57 @@ Weather prediction markets are inefficient because:
 6. If edge > 20% and models disagree with market favorite → TRADE
 ```
 
+## 2B. Latency Arbitrage Strategy (nyc_weather_arb.py)
+
+### 2B.1 The Edge
+Real-time NWS observations update before Kalshi prices reprice:
+1. Poll `api.weather.gov/stations/KNYC/observations/latest` every 60s
+2. NWS observations are raw station data (not aggregated forecasts)
+3. When temp crosses a strike price, buy YES before market catches up
+4. Settlement is next morning via NWS CLI report
+
+### 2B.2 Data Source
+| Source | Endpoint | Latency | Purpose |
+|--------|----------|---------|---------|
+| NWS KNYC | `api.weather.gov/stations/KNYC/observations/latest` | Real-time | Current temp |
+| NWS CLI | `forecast.weather.gov/product.php?...CLI...NYC` | Next morning | Settlement |
+
+### 2B.3 Trading Logic
+```
+1. Poll KNYC station every 60 seconds
+2. Convert Celsius → Fahrenheit (round to 1 decimal)
+3. Fetch today's KXHIGHNY strikes
+4. For each strike:
+   - If NWS_Temp >= (Strike + 0.2°F safety buffer)
+   - AND YES_Ask < 98¢ (profit available)
+   → Place limit order at 98¢ to sweep book
+5. Track traded tickers (no duplicate positions)
+```
+
+### 2B.4 Running the Arb Bot
+```bash
+# Paper trading (default)
+python3 nyc_weather_arb.py
+
+# Live trading
+python3 nyc_weather_arb.py --live
+
+# Single scan
+python3 nyc_weather_arb.py --once
+
+# Test strike parsing
+python3 nyc_weather_arb.py --test
+```
+
+### 2B.5 Key Parameters
+```
+├── SAFETY_BUFFER = 0.2°F      # Buffer above strike to confirm trigger
+├── SWEEP_PRICE = 98¢          # Limit order price
+├── MAX_POSITION_SIZE = $25    # Max per trade
+├── POLL_INTERVAL = 60s        # NWS polling rate
+└── MIN_PROFIT_THRESHOLD = 2¢  # Minimum profit to trade
+```
+
 ## 3. Market Structure
 
 ### 3.1 KXHIGHNY (NYC High Temperature)
@@ -72,17 +123,20 @@ Examples:
 |--------|--------------|------|---------|
 | Open-Meteo GFS | `api.open-meteo.com/v1/forecast` | Free | GFS forecasts |
 | Open-Meteo ECMWF | `api.open-meteo.com/v1/ecmwf` | Free | ECMWF forecasts |
-| Kalshi API | `trading-api.kalshi.com` | Free | Market data & trading |
+| NWS KNYC | `api.weather.gov/stations/KNYC/observations/latest` | Free | Real-time temp (arb) |
+| Kalshi API | `api.elections.kalshi.com/trade-api/v2` | Free | Market data & trading |
 
 ### 4.2 File Structure
 ```
 limitless/
-├── weather_bot.py      # Main trading bot
-├── weather_client.py   # Open-Meteo API wrapper
-├── kalshi_client.py    # Kalshi API wrapper
-├── alerts.py           # Discord notifications
-├── .env                # API credentials
-└── weather_paper_trades.jsonl  # Paper trade log
+├── weather_bot.py        # Model-based prediction bot (GFS/ECMWF)
+├── nyc_weather_arb.py    # Latency arbitrage bot (real-time NWS)
+├── weather_client.py     # Open-Meteo API wrapper
+├── kalshi_client.py      # Kalshi API wrapper
+├── alerts.py             # Discord notifications
+├── .env                  # API credentials
+├── weather_paper_trades.jsonl  # Prediction bot paper trades
+└── nyc_arb_trades.jsonl        # Arb bot trade log
 ```
 
 ### 4.3 Authentication
@@ -159,6 +213,12 @@ python3 weather_bot.py --live
 - `place_order()` - Execute trade
 - `get_balance()` - Check account balance
 
+**nyc_weather_arb.py:**
+- `NWSClient.get_latest_observation()` - Poll KNYC station
+- `get_todays_strikes()` - Fetch and parse KXHIGHNY contracts
+- `find_triggered_contracts()` - Compare NWS temp vs strikes
+- `execute_arb()` - Place sweep order at 98¢
+
 ### 8.3 Code Style
 - Async Python (asyncio/aiohttp)
 - Type hints where helpful
@@ -210,8 +270,10 @@ cat weather_paper_trades.jsonl
 
 ### API Endpoints
 ```
-GFS:   https://api.open-meteo.com/v1/forecast?latitude=40.7829&longitude=-73.9654&daily=temperature_2m_max&temperature_unit=fahrenheit
-ECMWF: https://api.open-meteo.com/v1/ecmwf?latitude=40.7829&longitude=-73.9654&daily=temperature_2m_max&temperature_unit=fahrenheit
+GFS:     https://api.open-meteo.com/v1/forecast?latitude=40.7829&longitude=-73.9654&daily=temperature_2m_max&temperature_unit=fahrenheit
+ECMWF:   https://api.open-meteo.com/v1/ecmwf?latitude=40.7829&longitude=-73.9654&daily=temperature_2m_max&temperature_unit=fahrenheit
+NWS:     https://api.weather.gov/stations/KNYC/observations/latest
+Kalshi:  https://api.elections.kalshi.com/trade-api/v2/markets?series_ticker=KXHIGHNY
 ```
 
 ### Kalshi Series

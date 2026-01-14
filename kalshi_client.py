@@ -60,7 +60,26 @@ class KalshiClient:
 
     async def start(self):
         """Initialize the client session and load keys."""
-        self.session = aiohttp.ClientSession()
+        # HFT-optimized connection pooling
+        connector = aiohttp.TCPConnector(
+            limit=10,
+            ttl_dns_cache=300,  # Cache DNS for 5 min (saves ~25ms)
+            keepalive_timeout=120,  # Keep connections warm
+            enable_cleanup_closed=True,
+            force_close=False,  # Reuse connections
+        )
+
+        # Fast timeout settings for order execution
+        timeout = aiohttp.ClientTimeout(
+            total=10,
+            connect=2,  # Fast connect timeout
+            sock_read=5,
+        )
+
+        self.session = aiohttp.ClientSession(
+            connector=connector,
+            timeout=timeout,
+        )
 
         if self.private_key_path and Path(self.private_key_path).exists():
             with open(self.private_key_path, "rb") as f:
