@@ -34,3 +34,5 @@ nyc_daily_max_temp.json
 # OS
 .DS_Store
 Thumbs.db
+CODEBASE.txt
+*.txt

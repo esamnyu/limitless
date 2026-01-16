@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# Auto-start wrapper for NYC Weather Arb Bot
+# Auto-start wrapper for NYC Sniper Bot
 # Called by launchd at 9:55 AM ET on weekdays
 # =============================================================================
 
@@ -19,7 +19,7 @@ echo "========================================" >> "$LOG_FILE"
 export PYTHONUNBUFFERED=1
 
 # Use caffeinate to prevent sleep during execution
-caffeinate -i python3 nyc_weather_arb.py --interval 60 >> "$LOG_FILE" 2>&1 &
+caffeinate -i python3 sniper.py --interval 60 >> "$LOG_FILE" 2>&1 &
 BOT_PID=$!
 
 echo $BOT_PID > .arb_bot.pid
