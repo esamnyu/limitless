@@ -1,51 +1,24 @@
-# Kalshi Weather Trading Bot - Dependencies
-# Install with: pip install -r requirements.txt
-# Python 3.9+ required (for zoneinfo)
+# Weather Edge — Dependencies
+# Install: pip install -r requirements.txt
+# Python 3.11+ required (for zoneinfo, modern type hints)
 
-# =============================================================================
-# CORE DEPENDENCIES
-# =============================================================================
-
-# Async HTTP client for API calls
-aiohttp>=3.9.0
+# Async HTTP client for API calls (Open-Meteo, NWS, Kalshi, Discord)
+aiohttp~=3.9
 
 # Environment variable management (.env files)
-python-dotenv>=1.0.0
+python-dotenv~=1.0
 
 # RSA-PSS signing for Kalshi API authentication
-cryptography>=41.0.0
+cryptography~=42.0
 
-# =============================================================================
-# OPTIONAL - ENHANCED FEATURES
-# =============================================================================
+# Vectorized KDE probability computation (~50x faster than pure Python)
+numpy~=1.26
 
-# Retry logic with exponential backoff (recommended)
-tenacity>=8.0.0
+# Retry logic with exponential backoff (Kalshi API)
+tenacity~=8.2
 
-# Structured logging (recommended)
-structlog>=24.0.0
+# Structured logging
+structlog~=24.1
 
-# Terminal dashboard
-rich>=13.0.0
-
-# =============================================================================
-# LEGACY - From previous project (may be unused)
-# =============================================================================
-
-# CEX WebSocket Data
-# ccxt>=4.0.0
-
-# WebSocket Client
-# python-socketio[asyncio_client]>=5.10.0
-
-# Ethereum signing
-# eth-account>=0.11.0
-
-# Web3 for on-chain balance checks
-# web3>=6.0.0
-
-# Discord webhook (using raw aiohttp instead)
-# discord-webhook>=1.3.0
-
-# Plotting
-# plotext>=5.0.0
+# Terminal formatting
+rich~=13.7

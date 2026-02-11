@@ -30,6 +30,11 @@ logs/
 # Runtime files
 *.pid
 nyc_daily_max_temp.json
+positions.json
+.positions.lock
+alerts_fallback.jsonl
+scan_logs/
+backtest/
 
 # OS
 .DS_Store

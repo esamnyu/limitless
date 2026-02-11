@@ -3,129 +3,273 @@
 
 import asyncio
 import base64
-import re
+import logging
 import time
-from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 import aiohttp
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_exception_type,
+    before_sleep_log,
+)
+
+from config import (
+    KALSHI_LIVE_URL,
+    KALSHI_DEMO_URL,
+    API_MIN_REQUEST_INTERVAL,
+    API_RETRY_ATTEMPTS,
+    API_RETRY_MIN_WAIT_SEC,
+    API_RETRY_MAX_WAIT_SEC,
+    API_RETRY_MULTIPLIER,
+    HTTP_TIMEOUT_TOTAL_SEC,
+    HTTP_TIMEOUT_CONNECT_SEC,
+    CONNECTION_POOL_LIMIT,
+    DNS_CACHE_TTL_SEC,
+    KEEPALIVE_TIMEOUT_SEC,
+    ORDERBOOK_DEPTH,
+)
+
+logger = logging.getLogger(__name__)
+
+__all__ = ["KalshiClient", "KalshiAPIError", "KalshiRateLimitError", "fetch_balance_quick"]
+
+
+class KalshiAPIError(Exception):
+    """Raised when Kalshi API returns an error."""
+    def __init__(self, status: int, message: str = ""):
+        self.status = status
+        self.message = message
+        super().__init__(f"Kalshi API error {status}: {message}")
+
+
+class KalshiRateLimitError(KalshiAPIError):
+    """Raised when rate limited by Kalshi API."""
+    def __init__(self, retry_after: int = 0):
+        self.retry_after = retry_after
+        super().__init__(429, f"Rate limited. Retry after {retry_after}s")
 
 
 class KalshiClient:
-    """Async client for Kalshi trading API."""
-    BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
-    DEMO_URL = "https://demo-api.kalshi.co/trade-api/v2"
+    """Async client for Kalshi trading API with retry logic."""
 
     def __init__(self, api_key_id: str = "", private_key_path: str = "", demo_mode: bool = True):
         self.api_key_id = api_key_id
         self.private_key_path = private_key_path
         self.demo_mode = demo_mode
-        self.base_url = self.DEMO_URL if demo_mode else self.BASE_URL
+        self.base_url = KALSHI_DEMO_URL if demo_mode else KALSHI_LIVE_URL
         self.private_key = None
         self.session: Optional[aiohttp.ClientSession] = None
-        self.last_request_time = 0
+        self.last_request_time = 0.0
+        self._request_count = 0
+        self._error_count = 0
 
     async def start(self):
+        """Initialize the client session and load credentials."""
         self.session = aiohttp.ClientSession(
-            connector=aiohttp.TCPConnector(limit=10, ttl_dns_cache=300, keepalive_timeout=120),
-            timeout=aiohttp.ClientTimeout(total=10, connect=2),
+            connector=aiohttp.TCPConnector(
+                limit=CONNECTION_POOL_LIMIT,
+                ttl_dns_cache=DNS_CACHE_TTL_SEC,
+                keepalive_timeout=KEEPALIVE_TIMEOUT_SEC,
+            ),
+            timeout=aiohttp.ClientTimeout(
+                total=HTTP_TIMEOUT_TOTAL_SEC,
+                connect=HTTP_TIMEOUT_CONNECT_SEC,
+            ),
         )
         if self.private_key_path and Path(self.private_key_path).exists():
             self.private_key = serialization.load_pem_private_key(
-                Path(self.private_key_path).read_bytes(), password=None)
+                Path(self.private_key_path).read_bytes(), password=None
+            )
+            logger.info("Kalshi client initialized with credentials")
+        else:
+            logger.warning("Kalshi client initialized WITHOUT credentials (public endpoints only)")
 
     async def stop(self):
+        """Close the client session."""
         if self.session:
             await self.session.close()
+            logger.info(f"Kalshi client stopped. Requests: {self._request_count}, Errors: {self._error_count}")
 
     def _sign(self, method: str, path: str) -> dict:
+        """Generate RSA-PSS signature for authenticated requests."""
         ts = str(int(time.time() * 1000))
         msg = f"{ts}{method}/trade-api/v2{path.split('?')[0]}"
-        sig = base64.b64encode(self.private_key.sign(
-            msg.encode(), padding.PSS(mgf=padding.MGF1(hashes.SHA256()),
-            salt_length=padding.PSS.DIGEST_LENGTH), hashes.SHA256())).decode()
-        return {"Content-Type": "application/json", "KALSHI-ACCESS-KEY": self.api_key_id,
-                "KALSHI-ACCESS-SIGNATURE": sig, "KALSHI-ACCESS-TIMESTAMP": ts}
+        sig = base64.b64encode(
+            self.private_key.sign(
+                msg.encode(),
+                padding.PSS(
+                    mgf=padding.MGF1(hashes.SHA256()),
+                    salt_length=padding.PSS.DIGEST_LENGTH,
+                ),
+                hashes.SHA256(),
+            )
+        ).decode()
+        return {
+            "Content-Type": "application/json",
+            "KALSHI-ACCESS-KEY": self.api_key_id,
+            "KALSHI-ACCESS-SIGNATURE": sig,
+            "KALSHI-ACCESS-TIMESTAMP": ts,
+        }
 
-    async def _req(self, method: str, path: str, data: dict = None, auth: bool = False) -> dict:
-        await asyncio.sleep(max(0, 0.1 - (time.time() - self.last_request_time)))
+    async def _rate_limit(self):
+        """Enforce minimum interval between requests."""
+        elapsed = time.time() - self.last_request_time
+        if elapsed < API_MIN_REQUEST_INTERVAL:
+            await asyncio.sleep(API_MIN_REQUEST_INTERVAL - elapsed)
         self.last_request_time = time.time()
+
+    @retry(
+        stop=stop_after_attempt(API_RETRY_ATTEMPTS),
+        wait=wait_exponential(
+            multiplier=API_RETRY_MULTIPLIER,
+            min=API_RETRY_MIN_WAIT_SEC,
+            max=API_RETRY_MAX_WAIT_SEC,
+        ),
+        retry=retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError, KalshiRateLimitError)),
+        before_sleep=before_sleep_log(logger, logging.WARNING),
+        reraise=True,
+    )
+    async def _req(self, method: str, path: str, data: dict = None, auth: bool = False) -> dict:
+        """Make an API request with automatic retry on transient failures."""
+        await self._rate_limit()
+        self._request_count += 1
+
         headers = self._sign(method, path) if auth and self.private_key else {"Content-Type": "application/json"}
+
         try:
             async with getattr(self.session, method.lower())(
                 f"{self.base_url}{path}", headers=headers, json=data
             ) as resp:
-                return await resp.json() if resp.status in (200, 201) else {}
-        except:
+                # Handle rate limiting with retry
+                if resp.status == 429:
+                    retry_after = int(resp.headers.get("Retry-After", 5))
+                    logger.warning(f"Rate limited on {method} {path}, retry after {retry_after}s")
+                    self._error_count += 1
+                    raise KalshiRateLimitError(retry_after)
+
+                # Handle other errors
+                if resp.status not in (200, 201):
+                    self._error_count += 1
+                    body = await resp.text()
+                    logger.warning(f"API error {resp.status} on {method} {path}: {body[:200]}")
+                    return {}
+
+                return await resp.json()
+
+        except asyncio.TimeoutError:
+            self._error_count += 1
+            logger.error(f"Timeout on {method} {path}")
+            raise
+        except aiohttp.ClientError as e:
+            self._error_count += 1
+            logger.error(f"HTTP error on {method} {path}: {e}")
+            raise
+
+    async def _req_safe(self, method: str, path: str, data: dict = None, auth: bool = False) -> dict:
+        """Make an API request, returning empty dict on all failures (safe version)."""
+        try:
+            return await self._req(method, path, data, auth)
+        except Exception as e:
+            logger.error(f"Request failed after retries: {method} {path} - {e}")
             return {}
 
-    async def get_exchange_status(self) -> dict:
-        return await self._req("GET", "/exchange/status")
+    # =========================================================================
+    # Public API Methods
+    # =========================================================================
 
     async def get_markets(self, series_ticker: str = None, status: str = "open", limit: int = 100) -> list:
+        """Get list of markets, optionally filtered by series ticker."""
         params = [f"limit={limit}"]
         if series_ticker:
             params.append(f"series_ticker={series_ticker}")
         if status:
             params.append(f"status={status}")
-        return (await self._req("GET", f"/markets?{'&'.join(params)}")).get("markets", [])
+        result = await self._req_safe("GET", f"/markets?{'&'.join(params)}")
+        return result.get("markets", [])
 
-    async def get_market(self, ticker: str) -> dict:
-        return await self._req("GET", f"/markets/{ticker}")
+    async def get_orderbook(self, ticker: str, depth: int = ORDERBOOK_DEPTH) -> dict:
+        """Get orderbook for a market."""
+        result = await self._req_safe("GET", f"/markets/{ticker}/orderbook?depth={depth}")
+        return result.get("orderbook", {})
 
-    async def get_orderbook(self, ticker: str, depth: int = 10) -> dict:
-        return (await self._req("GET", f"/markets/{ticker}/orderbook?depth={depth}")).get("orderbook", {})
+    # =========================================================================
+    # Authenticated API Methods
+    # =========================================================================
 
     async def get_balance(self) -> float:
-        return (await self._req("GET", "/portfolio/balance", auth=True)).get("balance", 0) / 100.0
+        """Get account balance in dollars."""
+        result = await self._req_safe("GET", "/portfolio/balance", auth=True)
+        return result.get("balance", 0) / 100.0
 
     async def get_positions(self) -> list:
-        return (await self._req("GET", "/portfolio/positions", auth=True)).get("market_positions", [])
+        """Get all open positions."""
+        result = await self._req_safe("GET", "/portfolio/positions", auth=True)
+        return result.get("market_positions", [])
 
-    async def get_orders(self, ticker: str = None) -> list:
-        path = f"/portfolio/orders?ticker={ticker}" if ticker else "/portfolio/orders"
-        return (await self._req("GET", path, auth=True)).get("orders", [])
+    async def get_fills(self, ticker: str = None, limit: int = 200) -> list:
+        """Get fill history."""
+        path = f"/portfolio/fills?limit={limit}"
+        if ticker:
+            path += f"&ticker={ticker}"
+        result = await self._req_safe("GET", path, auth=True)
+        return result.get("fills", [])
 
-    async def place_order(self, ticker: str, side: str, action: str, count: int, price: int, order_type: str = "limit") -> dict:
-        data = {"ticker": ticker, "side": side, "action": action, "count": count, "type": order_type}
+    async def place_order(
+        self,
+        ticker: str,
+        side: str,
+        action: str,
+        count: int,
+        price: int,
+        order_type: str = "limit",
+    ) -> dict:
+        """Place an order. Returns order details or empty dict on failure."""
+        data = {
+            "ticker": ticker,
+            "side": side,
+            "action": action,
+            "count": count,
+            "type": order_type,
+        }
         if order_type == "limit":
             data["yes_price" if side == "yes" else "no_price"] = price
-        return await self._req("POST", "/portfolio/orders", data, auth=True)
+
+        logger.info(f"Placing order: {side} {action} {count}x {ticker} @ {price}c")
+        return await self._req_safe("POST", "/portfolio/orders", data, auth=True)
+
+    async def get_orders(self, ticker: str = None, status: str = "resting") -> list:
+        """Get open orders."""
+        path = f"/portfolio/orders?status={status}"
+        if ticker:
+            path += f"&ticker={ticker}"
+        result = await self._req_safe("GET", path, auth=True)
+        return result.get("orders", [])
 
     async def cancel_order(self, order_id: str) -> dict:
-        return await self._req("DELETE", f"/portfolio/orders/{order_id}", auth=True)
-
-    def parse_market(self, market: dict) -> dict:
-        strike_type = market.get("strike_type", "")
-        strike = float(market.get("floor_strike" if strike_type in ("greater", "between") else "cap_strike", 0) or 0)
-        if strike == 0:
-            m = re.search(r"[BT](\d+(?:\.\d+)?)", market.get("ticker", ""))
-            strike = float(m.group(1)) if m else 0
-
-        yes_price = (market.get("yes_bid") or market.get("yes_ask") or market.get("last_price") or 50)
-        no_price = (market.get("no_bid") or market.get("no_ask") or 50)
-        if yes_price > 1:
-            yes_price /= 100
-        if no_price > 1:
-            no_price /= 100
-
-        try:
-            expiry_ts = datetime.fromisoformat(market.get("expiration_time", "").replace("Z", "+00:00")).timestamp()
-        except:
-            expiry_ts = 0
-
-        return {"ticker": market.get("ticker", ""), "title": market.get("title", ""),
-                "strike": strike, "strike_type": strike_type, "expiry_ts": expiry_ts,
-                "yes_price": yes_price, "no_price": no_price, "volume": market.get("volume", 0)}
+        """Cancel an order by ID."""
+        logger.info(f"Canceling order: {order_id}")
+        return await self._req_safe("DELETE", f"/portfolio/orders/{order_id}", auth=True)
 
 
-if __name__ == "__main__":
-    async def test():
-        c = KalshiClient(demo_mode=True)
-        await c.start()
-        print(await c.get_exchange_status())
-        await c.stop()
-    asyncio.run(test())
+async def fetch_balance_quick() -> float:
+    """Convenience: connect, fetch balance, disconnect. Returns 0.0 on failure."""
+    import os
+    api_key = os.getenv("KALSHI_API_KEY_ID")
+    pk_path = os.getenv("KALSHI_PRIVATE_KEY_PATH")
+    if not api_key or not pk_path:
+        return 0.0
+    client = KalshiClient(api_key_id=api_key, private_key_path=pk_path, demo_mode=False)
+    try:
+        await client.start()
+        return await client.get_balance()
+    except Exception as e:
+        logger.warning(f"Balance fetch failed: {e}")
+        return 0.0
+    finally:
+        await client.stop()
