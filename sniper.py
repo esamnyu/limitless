@@ -81,12 +81,16 @@ class NWSClient:
     """NWS API client for observations and hourly forecasts."""
     OBS_URL = "https://api.weather.gov/stations/KNYC/observations/latest"
     HOURLY_URL = "https://api.weather.gov/gridpoints/OKX/33,37/forecast/hourly"
+    FORECAST_CACHE_TTL = 120  # Cache forecasts for 2 minutes
 
     def __init__(self):
         self.session: Optional[aiohttp.ClientSession] = None
+        self._forecast_cache: list[HourlyForecast] = []
+        self._forecast_cache_time: float = 0
 
     async def start(self):
         self.session = aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(limit=10, ttl_dns_cache=300, keepalive_timeout=60),
             headers={"User-Agent": "NYC_Sniper/4.0", "Accept": "application/geo+json"},
             timeout=aiohttp.ClientTimeout(total=15, connect=5),
         )
@@ -110,15 +114,23 @@ class NWSClient:
             print(f"[ERR] Current temp fetch failed: {e}")
             return None
 
-    async def get_hourly_forecast(self) -> list[HourlyForecast]:
-        """Get hourly forecast including wind data."""
+    async def get_hourly_forecast(self, force_refresh: bool = False) -> list[HourlyForecast]:
+        """Get hourly forecast including wind data. Returns cached data if fresh."""
+        import time as _time
+        now = _time.monotonic()
+        if not force_refresh and self._forecast_cache and (now - self._forecast_cache_time) < self.FORECAST_CACHE_TTL:
+            return self._forecast_cache
+
         try:
             async with self.session.get(self.HOURLY_URL) as resp:
                 if resp.status != 200:
                     print(f"[ERR] Hourly forecast returned {resp.status}")
-                    return []
+                    return self._forecast_cache or []
                 data = await resp.json()
                 periods = data.get("properties", {}).get("periods", [])
+
+                # Pre-compile regex for wind parsing
+                wind_re = re.compile(r"(\d+)\s*(?:to\s*(\d+))?\s*mph", re.I)
 
                 forecasts = []
                 for p in periods[:48]:  # Next 48 hours
@@ -128,7 +140,7 @@ class NWSClient:
 
                         # Parse wind speed (e.g., "10 mph" or "5 to 10 mph")
                         wind_str = p.get("windSpeed", "0 mph")
-                        wind_match = re.search(r"(\d+)\s*(?:to\s*(\d+))?\s*mph", wind_str, re.I)
+                        wind_match = wind_re.search(wind_str)
                         if wind_match:
                             wind_speed = float(wind_match.group(2) or wind_match.group(1))
                         else:
@@ -147,10 +159,13 @@ class NWSClient:
                         ))
                     except Exception:
                         continue
+
+                self._forecast_cache = forecasts
+                self._forecast_cache_time = now
                 return forecasts
         except Exception as e:
             print(f"[ERR] Hourly forecast fetch failed: {e}")
-            return []
+            return self._forecast_cache or []
 
 
 class NYCSniper:
@@ -272,39 +287,64 @@ class NYCSniper:
             print(f"[ERR] Market fetch failed: {e}")
             return []
 
+    def _build_market_index(self, markets: list[dict]) -> dict:
+        """Pre-index markets by date string for O(1) date filtering."""
+        index: dict[str, list[tuple[str, int | None, int | None, dict]]] = {}
+        range_re = re.compile(r"(\d+)\s*(?:°|degrees?)?\s*to\s*(\d+)")
+        above_re = re.compile(r"(\d+)\s*(?:°|degrees?)?\s*or\s*above")
+        below_re = re.compile(r"(\d+)\s*(?:°|degrees?)?\s*or\s*below")
+
+        for m in markets:
+            ticker = m.get("ticker", "")
+            subtitle = m.get("subtitle", "").lower()
+
+            # Parse bracket into (type, low_or_threshold, high_or_none)
+            if "to" in subtitle:
+                match = range_re.search(subtitle)
+                if match:
+                    entry = ("range", int(match.group(1)), int(match.group(2)), m)
+                else:
+                    continue
+            elif "above" in subtitle:
+                match = above_re.search(subtitle)
+                if match:
+                    entry = ("above", int(match.group(1)), None, m)
+                else:
+                    continue
+            elif "below" in subtitle:
+                match = below_re.search(subtitle)
+                if match:
+                    entry = ("below", int(match.group(1)), None, m)
+                else:
+                    continue
+            else:
+                continue
+
+            # Extract date portion from ticker for grouping
+            # Tickers look like KXHIGHNY-26JAN17-B33.5
+            parts = ticker.split("-")
+            if len(parts) >= 2:
+                date_key = parts[1]
+                index.setdefault(date_key, []).append(entry)
+
+        return index
+
     def find_target_market(self, markets: list[dict], target_temp: float) -> Optional[dict]:
         """Find the market bracket containing the target temperature."""
         now = datetime.now(ET)
         tomorrow = now + timedelta(days=1)
         tomorrow_str = f"{tomorrow.year % 100:02d}{['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'][tomorrow.month-1]}{tomorrow.day:02d}"
 
-        for m in markets:
-            ticker = m.get("ticker", "")
-            if tomorrow_str not in ticker:
-                continue
+        market_index = self._build_market_index(markets)
+        candidates = market_index.get(tomorrow_str, [])
 
-            subtitle = m.get("subtitle", "").lower()
-
-            # Parse bracket range from subtitle
-            # e.g., "33 to 34" or "35 or above" or "32 or below"
-            if "to" in subtitle:
-                match = re.search(r"(\d+)\s*(?:°|degrees?)?\s*to\s*(\d+)", subtitle)
-                if match:
-                    low, high = int(match.group(1)), int(match.group(2))
-                    if low <= target_temp <= high:
-                        return m
-            elif "above" in subtitle:
-                match = re.search(r"(\d+)\s*(?:°|degrees?)?\s*or\s*above", subtitle)
-                if match:
-                    threshold = int(match.group(1))
-                    if target_temp >= threshold:
-                        return m
-            elif "below" in subtitle:
-                match = re.search(r"(\d+)\s*(?:°|degrees?)?\s*or\s*below", subtitle)
-                if match:
-                    threshold = int(match.group(1))
-                    if target_temp < threshold:
-                        return m
+        for bracket_type, val1, val2, m in candidates:
+            if bracket_type == "range" and val1 <= target_temp <= val2:
+                return m
+            elif bracket_type == "above" and target_temp >= val1:
+                return m
+            elif bracket_type == "below" and target_temp < val1:
+                return m
 
         return None
 

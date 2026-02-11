@@ -16,19 +16,35 @@ class AlertManager:
         self.webhook_url = webhook_url or os.getenv("DISCORD_WEBHOOK", "")
         self.alerted_milestones = set()
         self.wins = self.losses = 0
+        self._session: aiohttp.ClientSession | None = None
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        """Get or create a persistent aiohttp session."""
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(limit=5, ttl_dns_cache=300),
+                timeout=aiohttp.ClientTimeout(total=10),
+            )
+        return self._session
+
+    async def close(self):
+        """Close the persistent session."""
+        if self._session and not self._session.closed:
+            await self._session.close()
+            self._session = None
 
     async def send(self, title: str, message: str, color: int = 0x00FF00):
         """Send a Discord embed message."""
         if not self.webhook_url:
             return False
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(self.webhook_url, json={"embeds": [{
-                    "title": title, "description": message, "color": color,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "footer": {"text": "Kalshi Weather Bot"}
-                }]}) as resp:
-                    return resp.status in (200, 204)
+            session = await self._get_session()
+            async with session.post(self.webhook_url, json={"embeds": [{
+                "title": title, "description": message, "color": color,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "footer": {"text": "Kalshi Weather Bot"}
+            }]}) as resp:
+                return resp.status in (200, 204)
         except:
             return False
 

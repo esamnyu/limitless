@@ -51,16 +51,30 @@ class KalshiClient:
                 "KALSHI-ACCESS-SIGNATURE": sig, "KALSHI-ACCESS-TIMESTAMP": ts}
 
     async def _req(self, method: str, path: str, data: dict = None, auth: bool = False) -> dict:
-        await asyncio.sleep(max(0, 0.1 - (time.time() - self.last_request_time)))
-        self.last_request_time = time.time()
-        headers = self._sign(method, path) if auth and self.private_key else {"Content-Type": "application/json"}
-        try:
-            async with getattr(self.session, method.lower())(
-                f"{self.base_url}{path}", headers=headers, json=data
-            ) as resp:
-                return await resp.json() if resp.status in (200, 201) else {}
-        except:
-            return {}
+        max_retries = 3
+        backoff = 0.5
+        for attempt in range(max_retries):
+            await asyncio.sleep(max(0, 0.1 - (time.time() - self.last_request_time)))
+            self.last_request_time = time.time()
+            headers = self._sign(method, path) if auth and self.private_key else {"Content-Type": "application/json"}
+            try:
+                async with getattr(self.session, method.lower())(
+                    f"{self.base_url}{path}", headers=headers, json=data
+                ) as resp:
+                    if resp.status in (200, 201):
+                        return await resp.json()
+                    if resp.status == 429 or resp.status >= 500:
+                        # Retry on rate limit or server errors
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(backoff * (2 ** attempt))
+                            continue
+                    return {}
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(backoff * (2 ** attempt))
+                    continue
+                return {}
+        return {}
 
     async def get_exchange_status(self) -> dict:
         return await self._req("GET", "/exchange/status")

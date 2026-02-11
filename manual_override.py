@@ -156,8 +156,10 @@ async def snipe_opportunity(
     print("-" * 80)
 
     filled = False
-    for elapsed_minutes in range(max_wait_minutes):
-        await asyncio.sleep(60)  # Check every minute
+    poll_interval = 10  # Check every 10 seconds for faster fill detection
+    max_polls = max_wait_minutes * 60 // poll_interval
+    for poll_count in range(max_polls):
+        await asyncio.sleep(poll_interval)
 
         # Check order status
         orders = await client.get_orders(ticker=ticker)
@@ -167,15 +169,18 @@ async def snipe_opportunity(
         ).get('status')
 
         if entry_status == 'filled':
-            print(f"✅ FILLED at {entry_price_cents}¢ after {elapsed_minutes + 1} minutes!")
+            elapsed_sec = (poll_count + 1) * poll_interval
+            print(f"✅ FILLED at {entry_price_cents}¢ after {elapsed_sec}s!")
             await send_alert(f"✅ Sniper FILLED: {ticker} @ {entry_price_cents}¢")
             filled = True
             break
 
         # Progress update every 5 minutes
-        if (elapsed_minutes + 1) % 5 == 0:
-            remaining = max_wait_minutes - (elapsed_minutes + 1)
-            print(f"   ⏰ Still waiting... ({elapsed_minutes + 1}/{max_wait_minutes} min, {remaining} min remaining)")
+        elapsed_sec = (poll_count + 1) * poll_interval
+        if elapsed_sec % 300 == 0:
+            elapsed_min = elapsed_sec // 60
+            remaining = max_wait_minutes - elapsed_min
+            print(f"   ⏰ Still waiting... ({elapsed_min}/{max_wait_minutes} min, {remaining} min remaining)")
 
     if not filled:
         print(f"\n⏰ TIMEOUT: Entry order not filled after {max_wait_minutes} minutes")
