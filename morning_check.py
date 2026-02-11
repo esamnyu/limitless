@@ -24,9 +24,10 @@ from typing import Dict, Optional
 from zoneinfo import ZoneInfo
 
 import aiohttp
+from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 from position_store import load_positions
 from notifications import send_discord_alert

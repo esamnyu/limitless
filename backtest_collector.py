@@ -34,7 +34,7 @@ from zoneinfo import ZoneInfo
 import aiohttp
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 from log_setup import get_logger
 from edge_scanner_v2 import CITIES

@@ -25,9 +25,10 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import aiohttp
+from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 from log_setup import get_logger
 from config import (

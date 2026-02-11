@@ -37,9 +37,10 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import aiohttp
+from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 # Import the v2 scanner
 from edge_scanner_v2 import (

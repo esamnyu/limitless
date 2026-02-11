@@ -37,8 +37,9 @@ from zoneinfo import ZoneInfo
 import aiohttp
 import numpy as np
 from dotenv import load_dotenv
+from pathlib import Path
 
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 from log_setup import get_logger
 
@@ -1126,6 +1127,48 @@ def print_summary_v2(all_opps: list[Opportunity], balance: float):
         print(f"  This is NORMAL — high-confidence setups appear 2-5 times per week.")
 
 
+def _save_snapshot(city_key: str, target_date, ensemble: EnsembleV2, nws: NWSData, brackets: list, opps: list):
+    """Save ensemble + market snapshot for backtest calibration."""
+    try:
+        from backtest_collector import save_ensemble_snapshot
+        snapshot = {
+            "mean": ensemble.mean,
+            "std": ensemble.std,
+            "total_count": ensemble.total_count,
+            "kde_bandwidth": ensemble.kde_bandwidth,
+            "p10": ensemble.p10,
+            "p25": ensemble.p25,
+            "p50": ensemble.p50,
+            "p75": ensemble.p75,
+            "p90": ensemble.p90,
+            "per_model_means": {m.name: round(m.mean, 2) for m in ensemble.models},
+            "per_model_stds": {m.name: round(m.std, 2) for m in ensemble.models},
+            "per_model_counts": {m.name: len(m.members) for m in ensemble.models},
+            "nws_forecast_high": nws.forecast_high,
+            "nws_physics_high": nws.physics_high,
+            "nws_current_temp": nws.current_temp,
+            "nws_wind_penalty": nws.wind_penalty,
+            "nws_wet_bulb_penalty": nws.wet_bulb_penalty,
+            "nws_temp_trend": nws.temp_trend,
+            "bracket_prices": {
+                m.get("ticker", ""): {"yes_bid": m.get("yes_bid", 0), "yes_ask": m.get("yes_ask", 0)}
+                for m in brackets
+            },
+            "opportunities": [
+                {
+                    "ticker": o.ticker, "side": o.side,
+                    "kde_prob": round(o.kde_prob, 4),
+                    "confidence_score": round(o.confidence_score, 1),
+                    "edge": round(o.edge_after_fees, 4),
+                }
+                for o in opps
+            ],
+        }
+        save_ensemble_snapshot(city_key, datetime.combine(target_date, datetime.min.time()), snapshot)
+    except Exception as e:
+        logger.debug("Snapshot save skipped: %s", e)
+
+
 # ─── Main ──────────────────────────────────────────────
 
 async def scan(city_filter: str = None, show_timing: bool = False):
@@ -1229,6 +1272,9 @@ async def scan(city_filter: str = None, show_timing: bool = False):
                             logger.warning("LLM blend failed for %s: %s", opp.ticker, e)
 
                 all_opps.extend(opps)
+
+                # Save ensemble snapshot for backtest calibration
+                _save_snapshot(city_key, tomorrow, ensemble, nws_data, brackets, opps)
 
                 print_city_report_v2(city_key, ensemble, nws_data, brackets, opps)
 

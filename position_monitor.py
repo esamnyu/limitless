@@ -26,9 +26,10 @@ import sys
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 from kalshi_client import KalshiClient
 from position_store import load_positions, save_positions, position_transaction
