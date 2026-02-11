@@ -113,8 +113,8 @@ class TestSilvermanBandwidth:
         assert silverman_bandwidth([40.0]) == 1.0
 
     def test_zero_std(self):
-        """All identical → min bandwidth of 0.1."""
-        assert silverman_bandwidth([40.0, 40.0, 40.0]) == 0.1
+        """All identical → min bandwidth of 0.3 (floor prevents under-smoothing)."""
+        assert silverman_bandwidth([40.0, 40.0, 40.0]) == 0.3
 
     def test_positive_result(self):
         """Bandwidth should always be positive."""

@@ -184,7 +184,7 @@ def register_position(
             existing["avg_price"] = round((old_price * old_qty + price * quantity) / new_total, 1)
             existing["contracts"] = new_total
             existing["original_contracts"] = new_total
-            existing["exit_rules"]["freeroll_at"] = int(existing["avg_price"] * 2)
+            existing.setdefault("exit_rules", {})["freeroll_at"] = int(existing["avg_price"] * 2)
             existing.setdefault("notes", []).append(
                 f"{now.isoformat()}: Added {quantity}x @ {price}c (avg now {existing['avg_price']}c)"
             )

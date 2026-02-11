@@ -219,7 +219,7 @@ async def check_position(
     now = datetime.now(ET)
     hours_to_settlement = (SETTLEMENT_HOUR_ET - now.hour) % 24
     if hours_to_settlement > 12:
-        hours_to_settlement = 0  # We're past settlement time
+        hours_to_settlement -= 24  # Negative = hours past settlement
 
     # Rule 1: Price exploded — take profit
     if bid >= entry_price * 2 and contracts > 1:

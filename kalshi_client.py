@@ -131,7 +131,7 @@ class KalshiClient:
             min=API_RETRY_MIN_WAIT_SEC,
             max=API_RETRY_MAX_WAIT_SEC,
         ),
-        retry=retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError, KalshiRateLimitError)),
+        retry=retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError, KalshiRateLimitError, KalshiAPIError)),
         before_sleep=before_sleep_log(logger, logging.WARNING),
         reraise=True,
     )
@@ -153,12 +153,12 @@ class KalshiClient:
                     self._error_count += 1
                     raise KalshiRateLimitError(retry_after)
 
-                # Handle other errors
+                # Handle other errors — raise so callers can distinguish from empty results
                 if resp.status not in (200, 201):
                     self._error_count += 1
                     body = await resp.text()
                     logger.warning(f"API error {resp.status} on {method} {path}: {body[:200]}")
-                    return {}
+                    raise KalshiAPIError(resp.status, body[:200])
 
                 return await resp.json()
 

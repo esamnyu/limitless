@@ -215,7 +215,7 @@ async def run_scan(city_filter: str = None, quiet: bool = False, dry_run: bool =
                         "physics_high": nws_data.physics_high,
                         "conf_score": conf_score,
                     }
-                    save_ensemble_snapshot(city_key, datetime.now(ET) + timedelta(days=1), snapshot_data)
+                    save_ensemble_snapshot(city_key, datetime.combine(tomorrow, datetime.min.time()), snapshot_data)
                 except Exception:
                     pass  # Non-critical — don't break scan if snapshot fails
 

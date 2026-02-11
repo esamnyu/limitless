@@ -203,6 +203,8 @@ def kde_probability(members: list[float], low: float, high: float, bandwidth: fl
         if std == 0:
             return 1.0 if low <= m[0] < high else 0.0
         bandwidth = 1.06 * std * len(m) ** (-0.2)
+    # Floor: prevent under-smoothing with very tight ensembles
+    bandwidth = max(0.3, bandwidth)
 
     # Clamp integration range
     range_low = max(low, m.min() - 4 * bandwidth)
@@ -232,7 +234,7 @@ def silverman_bandwidth(members: list[float]) -> float:
         return 1.0
     m = np.asarray(members, dtype=np.float64)
     std = float(np.std(m))
-    return max(0.1, 1.06 * std * len(m) ** (-0.2))
+    return max(0.3, 1.06 * std * len(m) ** (-0.2))
 
 
 # ─── Model Weighting ──────────────────────────────────
@@ -646,7 +648,8 @@ def compute_confidence_score(ensemble: EnsembleV2, nws: NWSData, bracket_low: fl
 
     # ── Factor 3: Multi-model bracket agreement ── max +15 (NEW)
     # How many model families place >25% of members in the target bracket?
-    if bracket_low > -900 and bracket_high < 900 and ensemble.models:
+    # Applies to all bracket types including tails (low=-999 or high=999)
+    if ensemble.models:
         models_agree = 0
         total_models = 0
         for mg in ensemble.models:

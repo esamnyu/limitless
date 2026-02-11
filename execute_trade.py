@@ -131,12 +131,13 @@ async def execute(ticker: str, side: str, price: int, quantity: int, confirm: bo
         ob_yes_bid = 0
         ob_yes_ask = 0
         if orderbook.get("yes"):
-            bids = [l for l in orderbook["yes"] if l[1] > 0]
-            asks = [l for l in orderbook.get("no", []) if l[1] > 0]
-            if bids:
-                ob_yes_bid = max(b[0] for b in bids)
-            if asks:
-                ob_yes_ask = 100 - min(a[0] for a in asks)
+            yes_bids = [l for l in orderbook["yes"] if l[1] > 0]
+            if yes_bids:
+                ob_yes_bid = max(b[0] for b in yes_bids)
+        if orderbook.get("no"):
+            no_bids = [l for l in orderbook["no"] if l[1] > 0]
+            if no_bids:
+                ob_yes_ask = 100 - max(b[0] for b in no_bids)
 
         # ── Order summary ──
         max_payout = quantity

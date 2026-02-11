@@ -20,6 +20,7 @@ Usage:
 import asyncio
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -165,10 +166,14 @@ async def _query_model(
             data = await resp.json()
             content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
 
-            # Parse JSON response
-            # Strip markdown code fences if present
+            # Parse JSON response — robust extraction from markdown fences
             content = content.strip()
-            if content.startswith("```"):
+            # Try extracting JSON from code fences first
+            fence_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', content, re.DOTALL)
+            if fence_match:
+                content = fence_match.group(1)
+            elif content.startswith("```"):
+                # Fallback: strip fences manually
                 content = content.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
 
             parsed = json.loads(content)

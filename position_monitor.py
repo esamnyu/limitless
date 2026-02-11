@@ -115,7 +115,7 @@ async def _check_pending_sells(positions: list, client: KalshiClient, now: datet
                         color=0xFFAA00,
                     )
                 else:
-                    print(f"    {ticker}: pending_sell — order placed {elapsed_min:.0f}min ago, waiting...")
+                    print(f"    {ticker}: pending_sell — order placed {elapsed_min:.0f}min ago, waiting...")  # noqa: T201
     return actions
 
 
@@ -173,20 +173,21 @@ async def check_and_manage_positions():
             # Get current market price
             orderbook = await client.get_orderbook(ticker)
             current_bid = 0
-            current_ask = 0
 
-            if orderbook.get("yes"):
-                bids = [l for l in orderbook["yes"] if l[1] > 0]
-                asks = [l for l in orderbook.get("no", []) if l[1] > 0]
-                if bids:
-                    current_bid = max(b[0] for b in bids)
-                if asks:
-                    current_ask = 100 - min(a[0] for a in asks)
-
-            # For NO positions, flip the perspective
-            if side == "no":
-                sell_price = 100 - current_ask if current_ask > 0 else 0
+            # YES side: sell at YES bid. NO side: sell at NO bid (= 100 - YES ask).
+            if side == "yes":
+                if orderbook.get("yes"):
+                    bids = [l for l in orderbook["yes"] if l[1] > 0]
+                    if bids:
+                        current_bid = max(b[0] for b in bids)
+                sell_price = current_bid
             else:
+                # For NO positions, our sell price is the NO bid.
+                # Kalshi orderbook "no" key has NO bids directly.
+                if orderbook.get("no"):
+                    no_bids = [l for l in orderbook["no"] if l[1] > 0]
+                    if no_bids:
+                        current_bid = max(b[0] for b in no_bids)
                 sell_price = current_bid
 
             # Calculate P&L
@@ -329,15 +330,17 @@ async def check_and_manage_positions():
                         print(f"    New peak {sell_price}c — trailing floor raised to {floor}c")
 
                 # Liquidity check: require meaningful bid depth before triggering stop
-                # Prevents false triggers on thin 1¢ bids with no real volume
+                # Prevents false triggers on stale 1¢ bids with no real volume
                 bid_volume = 0
-                if orderbook.get("yes"):
-                    for lvl in orderbook["yes"]:
+                book_key = "yes" if side == "yes" else "no"
+                if orderbook.get(book_key):
+                    for lvl in orderbook[book_key]:
                         if lvl[0] == current_bid and lvl[1] > 0:
                             bid_volume = lvl[1]
                             break
 
-                thin_book = (bid_volume < 3 and sell_price < entry_price * 0.5)
+                # Thin book = no meaningful liquidity at the bid price
+                thin_book = (bid_volume < 3 and sell_price <= 5)
 
                 # Check if trailing stop triggered
                 if sell_price <= floor and sell_price > 0 and not thin_book:
