@@ -1,0 +1,965 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WEATHER EDGE — Scan Terminal</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Instrument+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0a0c10;
+  --bg-card: #0f1117;
+  --bg-card-hover: #141720;
+  --bg-surface: #181c26;
+  --border: #1e2330;
+  --border-active: #2a3040;
+  --text: #c8cdd8;
+  --text-dim: #6b7280;
+  --text-bright: #e8ecf4;
+  --amber: #f59e0b;
+  --amber-dim: #b45309;
+  --amber-glow: rgba(245, 158, 11, 0.08);
+  --cyan: #22d3ee;
+  --cyan-dim: #0891b2;
+  --cyan-glow: rgba(34, 211, 238, 0.06);
+  --green: #22c55e;
+  --green-dim: #15803d;
+  --red: #ef4444;
+  --red-dim: #991b1b;
+  --purple: #a78bfa;
+  --blue: #60a5fa;
+  --mono: 'JetBrains Mono', 'Fira Code', monospace;
+  --sans: 'Instrument Sans', -apple-system, sans-serif;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html { font-size: 13px; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--mono);
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+
+/* Scanline overlay */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 9999;
+  background: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    rgba(0,0,0,0.03) 2px,
+    rgba(0,0,0,0.03) 4px
+  );
+}
+
+/* ─── HEADER ─── */
+.header {
+  border-bottom: 1px solid var(--border);
+  padding: 16px 24px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: linear-gradient(180deg, rgba(245,158,11,0.03) 0%, transparent 100%);
+}
+
+.header-left {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.logo {
+  font-family: var(--sans);
+  font-weight: 700;
+  font-size: 1.15rem;
+  letter-spacing: 0.08em;
+  color: var(--amber);
+  text-transform: uppercase;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.logo-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--green);
+  box-shadow: 0 0 8px var(--green);
+  animation: pulse 2s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+.header-meta {
+  font-size: 0.85rem;
+  color: var(--text-dim);
+  display: flex;
+  gap: 20px;
+}
+
+.header-meta span { display: flex; align-items: center; gap: 5px; }
+.meta-label { color: var(--text-dim); }
+.meta-value { color: var(--text); font-weight: 500; }
+.meta-value.balance { color: var(--green); }
+
+/* ─── STAT STRIP ─── */
+.stat-strip {
+  display: flex;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-card);
+}
+
+.stat-cell {
+  flex: 1;
+  padding: 12px 20px;
+  border-right: 1px solid var(--border);
+  text-align: center;
+}
+
+.stat-cell:last-child { border-right: none; }
+
+.stat-number {
+  font-size: 1.6rem;
+  font-weight: 700;
+  color: var(--text-bright);
+  line-height: 1;
+}
+
+.stat-number.highlight { color: var(--amber); }
+.stat-number.danger { color: var(--red); }
+.stat-number.success { color: var(--green); }
+
+.stat-label {
+  font-size: 0.7rem;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  margin-top: 4px;
+}
+
+/* ─── CITY GRID ─── */
+.city-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
+  gap: 1px;
+  background: var(--border);
+  margin: 0;
+}
+
+.city-card {
+  background: var(--bg-card);
+  padding: 0;
+  transition: background 0.2s;
+  position: relative;
+  overflow: hidden;
+}
+
+.city-card::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: var(--border);
+  transition: background 0.3s;
+}
+
+.city-card.conf-high::before { background: var(--amber); box-shadow: 0 0 20px var(--amber-glow); }
+.city-card.conf-medium::before { background: var(--cyan); }
+.city-card.conf-low::before { background: var(--border-active); }
+
+/* City Header */
+.city-header {
+  padding: 14px 16px 10px;
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+}
+
+.city-name {
+  font-family: var(--sans);
+  font-weight: 700;
+  font-size: 1rem;
+  color: var(--text-bright);
+  letter-spacing: 0.02em;
+}
+
+.city-key {
+  color: var(--text-dim);
+  font-weight: 400;
+  font-size: 0.85rem;
+  margin-left: 6px;
+}
+
+.conf-badge {
+  padding: 3px 10px;
+  border-radius: 3px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  white-space: nowrap;
+}
+
+.conf-badge.elite { background: rgba(245,158,11,0.15); color: var(--amber); border: 1px solid var(--amber-dim); }
+.conf-badge.high { background: rgba(245,158,11,0.1); color: var(--amber); border: 1px solid rgba(245,158,11,0.3); }
+.conf-badge.medium { background: rgba(34,211,238,0.1); color: var(--cyan); border: 1px solid rgba(34,211,238,0.3); }
+.conf-badge.low { background: rgba(107,114,128,0.1); color: var(--text-dim); border: 1px solid var(--border); }
+
+/* Confidence Gauge */
+.conf-gauge-wrap {
+  padding: 0 16px 8px;
+}
+
+.conf-gauge-bar {
+  height: 4px;
+  background: var(--border);
+  border-radius: 2px;
+  overflow: hidden;
+  position: relative;
+}
+
+.conf-gauge-fill {
+  height: 100%;
+  border-radius: 2px;
+  transition: width 1s ease;
+  position: relative;
+}
+
+.conf-gauge-fill.elite { background: linear-gradient(90deg, var(--amber-dim), var(--amber)); }
+.conf-gauge-fill.high { background: linear-gradient(90deg, var(--amber-dim), var(--amber)); }
+.conf-gauge-fill.medium { background: linear-gradient(90deg, var(--cyan-dim), var(--cyan)); }
+.conf-gauge-fill.low { background: var(--text-dim); opacity: 0.4; }
+
+/* Ensemble Strip */
+.ensemble-strip {
+  display: flex;
+  padding: 0 16px 10px;
+  gap: 16px;
+  font-size: 0.8rem;
+}
+
+.ens-stat { display: flex; flex-direction: column; }
+.ens-stat-val { color: var(--text-bright); font-weight: 600; font-size: 1.1rem; }
+.ens-stat-label { color: var(--text-dim); font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.08em; }
+
+/* Model Breakdown */
+.model-grid {
+  padding: 0 16px 10px;
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 4px;
+}
+
+.model-pill {
+  background: var(--bg-surface);
+  border-radius: 3px;
+  padding: 5px 6px;
+  text-align: center;
+  font-size: 0.65rem;
+  position: relative;
+  border: 1px solid var(--border);
+}
+
+.model-pill.ai {
+  border-color: rgba(167, 139, 250, 0.4);
+  background: rgba(167, 139, 250, 0.05);
+}
+
+.model-pill-name {
+  color: var(--text-dim);
+  font-size: 0.6rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.model-pill.ai .model-pill-name { color: var(--purple); }
+
+.model-pill-temp {
+  color: var(--text-bright);
+  font-weight: 600;
+  font-size: 0.85rem;
+}
+
+.model-pill-std {
+  color: var(--text-dim);
+  font-size: 0.6rem;
+}
+
+/* NWS Strip */
+.nws-strip {
+  padding: 6px 16px;
+  background: var(--bg-surface);
+  display: flex;
+  gap: 14px;
+  font-size: 0.75rem;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+
+.nws-item { display: flex; gap: 4px; }
+.nws-item-label { color: var(--text-dim); }
+.nws-item-value { color: var(--text); font-weight: 500; }
+.nws-item-value.hot { color: var(--red); }
+.nws-item-value.cold { color: var(--cyan); }
+.nws-item-value.ok { color: var(--green); }
+.nws-item-value.diverge { color: var(--amber); }
+
+/* Bracket Table */
+.bracket-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.75rem;
+}
+
+.bracket-table th {
+  padding: 6px 10px;
+  text-align: right;
+  font-weight: 500;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  font-size: 0.6rem;
+  letter-spacing: 0.08em;
+  border-bottom: 1px solid var(--border);
+}
+
+.bracket-table th:first-child { text-align: left; }
+
+.bracket-table td {
+  padding: 5px 10px;
+  text-align: right;
+  border-bottom: 1px solid rgba(30,35,48,0.5);
+  font-variant-numeric: tabular-nums;
+}
+
+.bracket-table td:first-child { text-align: left; color: var(--text-dim); }
+
+.bracket-table tr:hover { background: var(--bg-card-hover); }
+
+.bid-cell { color: var(--text); }
+.edge-cell.positive { color: var(--green); }
+.edge-cell.negative { color: var(--red-dim); }
+.kde-cell { color: var(--cyan); }
+.vol-cell { color: var(--text-dim); font-size: 0.7rem; }
+
+/* KDE Bar (inline) */
+.kde-bar {
+  display: inline-block;
+  height: 3px;
+  background: var(--cyan);
+  border-radius: 1px;
+  margin-right: 6px;
+  vertical-align: middle;
+  opacity: 0.6;
+}
+
+/* Opportunity Rows */
+.opp-section {
+  padding: 8px 16px;
+  border-top: 1px solid var(--border);
+}
+
+.opp-section-title {
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--text-dim);
+  margin-bottom: 6px;
+}
+
+.opp-row {
+  padding: 6px 0;
+  border-bottom: 1px solid rgba(30,35,48,0.4);
+  display: grid;
+  grid-template-columns: 60px 1fr auto;
+  gap: 10px;
+  align-items: center;
+}
+
+.opp-side {
+  font-weight: 700;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  padding: 2px 8px;
+  border-radius: 2px;
+  text-align: center;
+  width: fit-content;
+}
+
+.opp-side.yes { background: rgba(34,197,94,0.12); color: var(--green); border: 1px solid rgba(34,197,94,0.3); }
+.opp-side.no { background: rgba(239,68,68,0.1); color: var(--red); border: 1px solid rgba(239,68,68,0.2); }
+
+.opp-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.opp-bracket { color: var(--text); font-weight: 500; font-size: 0.8rem; }
+.opp-ticker { color: var(--text-dim); font-size: 0.65rem; }
+
+.opp-stats {
+  display: flex;
+  gap: 12px;
+  font-size: 0.75rem;
+  align-items: center;
+}
+
+.opp-edge { color: var(--green); font-weight: 600; }
+.opp-kde { color: var(--cyan); }
+.opp-ts { font-weight: 600; }
+.opp-ts.hot { color: var(--amber); }
+.opp-ts.warm { color: var(--cyan); }
+.opp-ts.cold { color: var(--text-dim); }
+
+/* Strategies */
+.strat-tags {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+  padding: 4px 16px 10px;
+}
+
+.strat-tag {
+  font-size: 0.6rem;
+  padding: 2px 6px;
+  border-radius: 2px;
+  background: var(--bg-surface);
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  letter-spacing: 0.02em;
+}
+
+.strat-tag.wind { border-color: rgba(96,165,250,0.3); color: var(--blue); }
+.strat-tag.diverge { border-color: rgba(245,158,11,0.3); color: var(--amber); }
+.strat-tag.midnight { border-color: rgba(167,139,250,0.3); color: var(--purple); }
+.strat-tag.trend { border-color: rgba(34,197,94,0.3); color: var(--green); }
+.strat-tag.wet { border-color: rgba(34,211,238,0.3); color: var(--cyan); }
+
+/* ─── OPPORTUNITY TABLE (bottom) ─── */
+.bottom-section {
+  border-top: 2px solid var(--border);
+  padding: 16px 24px 32px;
+}
+
+.section-title {
+  font-family: var(--sans);
+  font-weight: 700;
+  font-size: 0.9rem;
+  color: var(--text-bright);
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  margin-bottom: 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.section-title .count {
+  background: var(--bg-surface);
+  padding: 2px 8px;
+  border-radius: 3px;
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  color: var(--text-dim);
+}
+
+.opp-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8rem;
+}
+
+.opp-table thead th {
+  padding: 8px 12px;
+  text-align: right;
+  font-weight: 500;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  font-size: 0.65rem;
+  letter-spacing: 0.08em;
+  border-bottom: 2px solid var(--border);
+  position: sticky;
+  top: 0;
+  background: var(--bg);
+}
+
+.opp-table thead th:first-child,
+.opp-table thead th:nth-child(2),
+.opp-table thead th:nth-child(3) { text-align: left; }
+
+.opp-table tbody td {
+  padding: 8px 12px;
+  text-align: right;
+  border-bottom: 1px solid var(--border);
+  font-variant-numeric: tabular-nums;
+}
+
+.opp-table tbody td:first-child,
+.opp-table tbody td:nth-child(2),
+.opp-table tbody td:nth-child(3) { text-align: left; }
+
+.opp-table tbody tr { transition: background 0.15s; }
+.opp-table tbody tr:hover { background: var(--bg-card-hover); }
+
+.rank-num {
+  display: inline-flex;
+  width: 22px;
+  height: 22px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 3px;
+  font-weight: 600;
+  font-size: 0.7rem;
+}
+
+.rank-num.top { background: rgba(245,158,11,0.15); color: var(--amber); }
+.rank-num.normal { background: var(--bg-surface); color: var(--text-dim); }
+
+.ts-bar-wrap {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  justify-content: flex-end;
+}
+
+.ts-bar {
+  width: 50px;
+  height: 4px;
+  background: var(--border);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.ts-bar-fill {
+  height: 100%;
+  border-radius: 2px;
+  transition: width 0.8s ease;
+}
+
+.ts-bar-fill.hot { background: var(--amber); }
+.ts-bar-fill.warm { background: var(--cyan); }
+.ts-bar-fill.cold { background: var(--text-dim); }
+
+/* Footer */
+.footer {
+  padding: 12px 24px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.7rem;
+  color: var(--text-dim);
+  background: var(--bg-card);
+}
+
+/* Loading */
+.loading {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100vh;
+  gap: 16px;
+}
+
+.loading-spinner {
+  width: 32px;
+  height: 32px;
+  border: 2px solid var(--border);
+  border-top-color: var(--amber);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.loading-text { color: var(--text-dim); font-size: 0.85rem; }
+
+/* Animations */
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.animate-in {
+  animation: fadeIn 0.4s ease forwards;
+  opacity: 0;
+}
+
+/* scrollbar */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: var(--bg); }
+::-webkit-scrollbar-thumb { background: var(--border-active); border-radius: 3px; }
+
+</style>
+</head>
+<body>
+
+<div id="app">
+  <div class="loading">
+    <div class="loading-spinner"></div>
+    <div class="loading-text">Loading scan data...</div>
+  </div>
+</div>
+
+<script>
+const MODEL_LABELS = {
+  'ecmwf_ifs025': 'IFS',
+  'ecmwf_aifs025': 'AIFS',
+  'gfs_seamless': 'GFS',
+  'icon_seamless': 'ICON',
+  'gem_global': 'GEM',
+};
+
+function confClass(score) {
+  if (score >= 90) return 'elite';
+  if (score >= 75) return 'high';
+  if (score >= 55) return 'medium';
+  return 'low';
+}
+
+function tsClass(ts) {
+  if (ts >= 0.55) return 'hot';
+  if (ts >= 0.35) return 'warm';
+  return 'cold';
+}
+
+function trendClass(trend) {
+  if (trend === 'running_hot') return 'hot';
+  if (trend === 'running_cold') return 'cold';
+  if (trend === 'on_track') return 'ok';
+  return '';
+}
+
+function trendLabel(trend) {
+  if (trend === 'running_hot') return '↑ HOT';
+  if (trend === 'running_cold') return '↓ COLD';
+  if (trend === 'on_track') return '✓ ON TRACK';
+  return trend;
+}
+
+function stratClass(s) {
+  if (s.startsWith('B:WIND')) return 'wind';
+  if (s.startsWith('E:NWS')) return 'diverge';
+  if (s.startsWith('A:MIDNIGHT')) return 'midnight';
+  if (s.startsWith('D:WET')) return 'wet';
+  if (s.includes('TREND')) return 'trend';
+  return '';
+}
+
+function shortBracket(title) {
+  // Extract just the temp range
+  const m = title.match(/(\d+)-(\d+)°/);
+  if (m) return `${m[1]}-${m[2]}°F`;
+  const lt = title.match(/<(\d+)°/);
+  if (lt) return `<${lt[1]}°F`;
+  const gt = title.match(/>(\d+)°/);
+  if (gt) return `>${gt[1]}°F`;
+  return title.replace(/Will the \*\*high temp.*?\*\* be /, '').replace(/ on.*/, '');
+}
+
+function formatVol(v) {
+  if (v >= 10000) return (v/1000).toFixed(0) + 'k';
+  if (v >= 1000) return (v/1000).toFixed(1) + 'k';
+  return v.toString();
+}
+
+function renderDashboard(data) {
+  const scanTime = new Date(data.scan_time);
+  const cities = data.cities.filter(c => c.status === 'ok');
+  const bestConf = data.summary.best_confidence;
+  const bestTS = data.summary.best_trade_score;
+
+  // Filter to tomorrow's brackets only
+  const targetDate = data.target_date; // "2026-02-14"
+  const dateCode = targetDate.replace(/-/g, '').slice(2); // "26FEB14" pattern
+  // Actually parse: 2026-02-14 -> "26FEB14"
+  const d = new Date(targetDate + 'T12:00:00');
+  const months = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
+  const targetCode = targetDate.slice(2,4) + months[d.getMonth()] + targetDate.slice(8,10);
+
+  let html = '';
+
+  // ─── HEADER ───
+  html += `
+  <div class="header animate-in">
+    <div class="header-left">
+      <div class="logo">
+        <div class="logo-dot"></div>
+        WEATHER EDGE
+      </div>
+      <div class="header-meta">
+        <span><span class="meta-label">Target</span> <span class="meta-value">${data.target_display}</span></span>
+        <span><span class="meta-label">Scanned</span> <span class="meta-value">${scanTime.toLocaleTimeString('en-US', {hour:'numeric', minute:'2-digit', timeZoneName:'short'})}</span></span>
+        <span><span class="meta-label">Balance</span> <span class="meta-value balance">$${data.balance.toFixed(2)}</span></span>
+      </div>
+    </div>
+  </div>`;
+
+  // ─── STAT STRIP ───
+  html += `
+  <div class="stat-strip animate-in" style="animation-delay:0.05s">
+    <div class="stat-cell">
+      <div class="stat-number">${cities.length}</div>
+      <div class="stat-label">Cities Scanned</div>
+    </div>
+    <div class="stat-cell">
+      <div class="stat-number">${data.summary.total_opportunities}</div>
+      <div class="stat-label">Opportunities</div>
+    </div>
+    <div class="stat-cell">
+      <div class="stat-number ${data.summary.tradeable_count > 0 ? 'success' : ''}">${data.summary.tradeable_count}</div>
+      <div class="stat-label">Tradeable (TS≥0.55)</div>
+    </div>
+    <div class="stat-cell">
+      <div class="stat-number highlight">${bestConf}</div>
+      <div class="stat-label">Best Confidence</div>
+    </div>
+    <div class="stat-cell">
+      <div class="stat-number ${tsClass(bestTS) === 'hot' ? 'highlight' : ''}">${bestTS.toFixed(3)}</div>
+      <div class="stat-label">Best Trade Score</div>
+    </div>
+    <div class="stat-cell">
+      <div class="stat-number">194</div>
+      <div class="stat-label">Ensemble Members</div>
+    </div>
+  </div>`;
+
+  // ─── CITY CARDS ───
+  html += `<div class="city-grid">`;
+
+  for (const city of cities) {
+    const ens = city.ensemble;
+    const nws = city.nws;
+    const score = city.confidence.score;
+    const label = city.confidence.label.toLowerCase();
+    const delay = (cities.indexOf(city) * 0.07 + 0.1).toFixed(2);
+
+    // Filter tomorrow's brackets
+    const tmBrackets = city.brackets.filter(b => b.ticker.includes(targetCode));
+
+    // Collect unique strategies
+    const allStrats = [...new Set(city.opportunities.flatMap(o => o.strategies))];
+
+    html += `
+    <div class="city-card conf-${label} animate-in" style="animation-delay:${delay}s">
+      <div class="city-header">
+        <div>
+          <span class="city-name">${city.name}</span>
+          <span class="city-key">${city.key}</span>
+        </div>
+        <div class="conf-badge ${label}">${score}/100 ${label.toUpperCase()}</div>
+      </div>
+
+      <div class="conf-gauge-wrap">
+        <div class="conf-gauge-bar">
+          <div class="conf-gauge-fill ${label}" style="width:${score}%"></div>
+        </div>
+      </div>
+
+      <div class="ensemble-strip">
+        <div class="ens-stat">
+          <span class="ens-stat-val">${ens.mean}°</span>
+          <span class="ens-stat-label">Mean</span>
+        </div>
+        <div class="ens-stat">
+          <span class="ens-stat-val">±${ens.std}°</span>
+          <span class="ens-stat-label">Spread (σ)</span>
+        </div>
+        <div class="ens-stat">
+          <span class="ens-stat-val">${ens.p10}–${ens.p90}°</span>
+          <span class="ens-stat-label">P10–P90</span>
+        </div>
+        <div class="ens-stat">
+          <span class="ens-stat-val">${ens.kde_bandwidth}</span>
+          <span class="ens-stat-label">KDE bw</span>
+        </div>
+      </div>
+
+      <div class="model-grid">
+        ${ens.models.map(m => `
+          <div class="model-pill ${m.is_ai ? 'ai' : ''}">
+            <div class="model-pill-name">${m.is_ai ? '★ ' : ''}${MODEL_LABELS[m.name] || m.name}</div>
+            <div class="model-pill-temp">${m.mean}°</div>
+            <div class="model-pill-std">±${m.std}° · ${m.eff_weight}w</div>
+          </div>
+        `).join('')}
+      </div>
+
+      <div class="nws-strip">
+        <div class="nws-item">
+          <span class="nws-item-label">NWS</span>
+          <span class="nws-item-value ${Math.abs(nws.forecast_high - ens.mean) > 2.5 ? 'diverge' : ''}">${nws.forecast_high}°F</span>
+        </div>
+        <div class="nws-item">
+          <span class="nws-item-label">Physics</span>
+          <span class="nws-item-value">${nws.physics_high}°F</span>
+        </div>
+        <div class="nws-item">
+          <span class="nws-item-label">Now</span>
+          <span class="nws-item-value">${nws.current_temp}°F</span>
+        </div>
+        <div class="nws-item">
+          <span class="nws-item-label">Trend</span>
+          <span class="nws-item-value ${trendClass(nws.temp_trend)}">${trendLabel(nws.temp_trend)}</span>
+        </div>
+        ${nws.wind_penalty ? `<div class="nws-item"><span class="nws-item-label">Wind</span><span class="nws-item-value cold">${nws.wind_penalty > 0 ? '-' : ''}${nws.wind_penalty}° (${nws.peak_wind_gust}mph)</span></div>` : ''}
+        ${Math.abs(nws.forecast_high - ens.mean) > 2 ? `<div class="nws-item"><span class="nws-item-label">Δ NWS</span><span class="nws-item-value diverge">${(nws.forecast_high - ens.mean) > 0 ? '+' : ''}${(nws.forecast_high - ens.mean).toFixed(1)}°F</span></div>` : ''}
+      </div>
+
+      <table class="bracket-table">
+        <thead>
+          <tr>
+            <th>Bracket</th>
+            <th>Bid</th>
+            <th>Ask</th>
+            <th>KDE</th>
+            <th>Edge</th>
+            <th>Vol</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${tmBrackets.map(b => {
+            const opp = city.opportunities.find(o => o.ticker === b.ticker);
+            const kde = opp ? opp.kde_prob : 0;
+            const edge = opp ? opp.edge_raw : 0;
+            const kdeW = Math.min(kde, 60); // cap bar width
+            return `
+            <tr>
+              <td>${shortBracket(b.title)}</td>
+              <td class="bid-cell">${b.yes_bid}¢</td>
+              <td class="bid-cell">${b.yes_ask}¢</td>
+              <td class="kde-cell"><span class="kde-bar" style="width:${kdeW}px"></span>${kde.toFixed(0)}%</td>
+              <td class="edge-cell ${edge > 0 ? 'positive' : 'negative'}">${edge > 0 ? '+' : ''}${edge.toFixed(0)}¢</td>
+              <td class="vol-cell">${formatVol(b.volume)}</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>
+
+      ${allStrats.length > 0 ? `
+      <div class="strat-tags">
+        ${allStrats.map(s => `<span class="strat-tag ${stratClass(s)}">${s}</span>`).join('')}
+      </div>` : ''}
+
+      ${city.opportunities.length > 0 ? `
+      <div class="opp-section">
+        <div class="opp-section-title">Top Opportunities</div>
+        ${city.opportunities.slice(0, 3).map(opp => `
+          <div class="opp-row">
+            <div class="opp-side ${opp.side}">${opp.side}</div>
+            <div class="opp-detail">
+              <span class="opp-bracket">${shortBracket(opp.bracket_title)} @ ${opp.side === 'yes' ? opp.yes_bid : (100 - opp.yes_ask)}¢</span>
+              <span class="opp-ticker">${opp.ticker}</span>
+            </div>
+            <div class="opp-stats">
+              <span class="opp-edge">+${opp.edge_raw.toFixed(0)}¢</span>
+              <span class="opp-kde">${opp.kde_prob.toFixed(0)}%</span>
+              <span class="opp-ts ${tsClass(opp.trade_score)}">${opp.trade_score.toFixed(3)}</span>
+            </div>
+          </div>
+        `).join('')}
+      </div>` : ''}
+    </div>`;
+  }
+
+  html += `</div>`;
+
+  // ─── ALL OPPORTUNITIES TABLE ───
+  const sortedOpps = [...data.all_opportunities].sort((a, b) => b.trade_score - a.trade_score);
+
+  html += `
+  <div class="bottom-section animate-in" style="animation-delay:0.5s">
+    <div class="section-title">
+      All Opportunities — Ranked by Trade Score
+      <span class="count">${sortedOpps.length}</span>
+    </div>
+    <table class="opp-table">
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>City</th>
+          <th>Side</th>
+          <th>Bracket</th>
+          <th>Price</th>
+          <th>KDE</th>
+          <th>Edge</th>
+          <th>Conf</th>
+          <th>Trade Score</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${sortedOpps.slice(0, 15).map((opp, i) => {
+          const price = opp.side === 'yes' ? opp.yes_bid : (100 - opp.yes_ask);
+          const ts = opp.trade_score;
+          return `
+          <tr>
+            <td><span class="rank-num ${i < 3 ? 'top' : 'normal'}">${i + 1}</span></td>
+            <td style="font-weight:600">${opp.city}</td>
+            <td><span class="opp-side ${opp.side}" style="font-size:0.7rem">${opp.side.toUpperCase()}</span></td>
+            <td>${shortBracket(opp.bracket_title)}</td>
+            <td class="bid-cell">${price}¢</td>
+            <td class="kde-cell">${opp.kde_prob.toFixed(0)}%</td>
+            <td class="edge-cell positive">+${opp.edge_raw.toFixed(0)}¢</td>
+            <td>
+              <span class="conf-badge ${confClass(opp.confidence_score)}" style="font-size:0.65rem;padding:1px 6px">
+                ${opp.confidence_score}
+              </span>
+            </td>
+            <td>
+              <div class="ts-bar-wrap">
+                <span class="opp-ts ${tsClass(ts)}">${ts.toFixed(3)}</span>
+                <div class="ts-bar">
+                  <div class="ts-bar-fill ${tsClass(ts)}" style="width:${(ts / 0.7 * 100).toFixed(0)}%"></div>
+                </div>
+              </div>
+            </td>
+          </tr>`;
+        }).join('')}
+      </tbody>
+    </table>
+  </div>`;
+
+  // ─── FOOTER ───
+  html += `
+  <div class="footer">
+    <span>EDGE SCANNER v2.0 · KDE + Model Weighting + Bot Protection · ${data.summary.cities_scanned} cities</span>
+    <span>${data.summary.tradeable_count === 0 ? 'No setups above threshold · Patience IS the edge' : data.summary.tradeable_count + ' tradeable setup(s) found'}</span>
+  </div>`;
+
+  document.getElementById('app').innerHTML = html;
+}
+
+// Load data
+fetch('scan_data.json')
+  .then(r => r.json())
+  .then(data => {
+    setTimeout(() => renderDashboard(data), 300);
+  })
+  .catch(err => {
+    document.getElementById('app').innerHTML = `
+      <div class="loading">
+        <div style="color:var(--red);font-size:1.1rem">Failed to load scan data</div>
+        <div style="color:var(--text-dim)">${err.message}</div>
+      </div>`;
+  });
+</script>
+</body>
+</html>

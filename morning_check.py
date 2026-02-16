@@ -31,6 +31,10 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 
 from position_store import load_positions
 from notifications import send_discord_alert
+from log_setup import get_logger
+from trade_events import log_event, TradeEvent
+
+logger = get_logger(__name__)
 from edge_scanner_v2 import (
     CITIES,
     fetch_ensemble_v2,
@@ -68,14 +72,14 @@ async def fetch_nws_obs(session: aiohttp.ClientSession, city_key: str) -> Option
             data = await resp.json()
         props = data.get("properties", {})
         temp_c = props.get("temperature", {}).get("value")
-        wind_ms = props.get("windSpeed", {}).get("value")
+        wind_kmh = props.get("windSpeed", {}).get("value")
         obs_time = props.get("timestamp", "")
         if temp_c is not None:
             temp_f = temp_c * 1.8 + 32
-            wind_mph = wind_ms * 2.237 if wind_ms else 0
+            wind_mph = wind_kmh * 0.621371 if wind_kmh else 0  # km/h → mph
             return {"temp_f": round(temp_f, 1), "wind_mph": round(wind_mph, 1), "time": obs_time}
     except Exception as e:
-        print(f"    [ERR] NWS obs for {city_key}: {e}")
+        logger.warning("NWS obs for %s: %s", city_key, e)
     return None
 
 
@@ -94,7 +98,7 @@ async def fetch_bracket_price(session: aiohttp.ClientSession, ticker: str, serie
                     "title": m.get("title", "") or m.get("subtitle", ""),
                 }
     except Exception as e:
-        print(f"    [ERR] Kalshi price for {ticker}: {e}")
+        logger.warning("Kalshi price for %s: %s", ticker, e)
     return None
 
 
@@ -127,8 +131,7 @@ async def check_position(
     city = CITIES[city_key]
     series = city["series"]
 
-    print(f"\n  {'─'*50}")
-    print(f"  {side.upper()} {contracts}x {ticker} @ {entry_price}c")
+    logger.info("%s %dx %s @ %dc (cost $%.2f)", side.upper(), contracts, ticker, entry_price, cost)
 
     # Fetch fresh data in parallel
     try:
@@ -146,7 +149,7 @@ async def check_position(
         errors = [(i, r) for i, r in enumerate(results) if isinstance(r, Exception)]
         for i, err in errors:
             names = ["ensemble", "nws_forecast", "nws_obs", "bracket_price"]
-            print(f"    [WARN] {names[i]} fetch failed: {err}")
+            logger.warning("%s fetch failed for %s: %s", names[i], ticker, err)
 
         ensemble = results[0] if not isinstance(results[0], Exception) else None
         nws_data = results[1] if not isinstance(results[1], Exception) else None
@@ -165,11 +168,11 @@ async def check_position(
     if bracket_type == "unknown":
         return {"ticker": ticker, "action": "MANUAL_CHECK", "reason": f"Could not parse bracket from title: {market_title}"}
 
-    print(f"  City: {city['name']} | Bracket: {low}-{high}°F | Cost: ${cost:.2f}")
+    logger.info("  City: %s | Bracket: %s-%s°F", city["name"], low, high)
 
     # ── Current Observations ──
     if obs:
-        print(f"  Current: {obs['temp_f']}°F  Wind: {obs['wind_mph']} mph")
+        logger.info("  Current obs: %.1f°F  Wind: %.1f mph", obs["temp_f"], obs["wind_mph"])
 
     # ── Ensemble Analysis ──
     ensemble_prob = 0.0
@@ -185,24 +188,21 @@ async def check_position(
         elif bracket_type == "low_tail":
             ensemble_prob = kde_probability(ensemble.weighted_members, -100, high, ensemble.kde_bandwidth)
 
-        print(f"  Ensemble: {ensemble.total_count} members | Mean: {ensemble_mean:.1f}°F ±{ensemble_std:.1f}")
-        print(f"  KDE prob in bracket: {ensemble_prob*100:.1f}%")
+        logger.info("  Ensemble: %d members | Mean: %.1f°F ±%.1f | KDE: %.1f%%",
+                    ensemble.total_count, ensemble_mean, ensemble_std, ensemble_prob * 100)
 
         # Confidence score
         if nws_data:
             conf_label, conf_score, _ = compute_confidence_score(ensemble, nws_data)
-            print(f"  Confidence: {conf_label} ({conf_score:.0f}/100)")
+            logger.info("  Confidence: %s (%.0f/100)", conf_label, conf_score)
 
     # ── NWS Forecast ──
     if nws_data:
-        print(f"  NWS forecast high: {nws_data.forecast_high:.0f}°F | Physics: {nws_data.physics_high:.1f}°F")
         nws_in_bracket = low <= nws_data.forecast_high < high if bracket_type == "range" else (
             nws_data.forecast_high >= low if bracket_type == "high_tail" else nws_data.forecast_high < high
         )
-        if nws_in_bracket:
-            print(f"  NWS forecast IS in our bracket ✓")
-        else:
-            print(f"  NWS forecast is OUTSIDE our bracket ✗")
+        nws_status = "IN bracket" if nws_in_bracket else "OUTSIDE bracket"
+        logger.info("  NWS: %.0f°F | Physics: %.1f°F | %s", nws_data.forecast_high, nws_data.physics_high, nws_status)
 
     # ── Market Price ──
     bid = 0
@@ -211,7 +211,7 @@ async def check_position(
         ask = price["ask"]
         roi = ((bid - entry_price) / entry_price * 100) if entry_price > 0 and bid > 0 else -100
         pnl = contracts * (bid - entry_price) / 100
-        print(f"  Market: Bid={bid}c Ask={ask}c | ROI: {roi:+.0f}% | P&L: ${pnl:+.2f}")
+        logger.info("  Market: Bid=%dc Ask=%dc | ROI: %+.0f%% | P&L: $%+.2f", bid, ask, roi, pnl)
 
     # ══════════════════════════════════════════
     #  DECISION ENGINE
@@ -226,33 +226,49 @@ async def check_position(
         sell_qty = max(1, contracts // 2)
         action = f"SELL {sell_qty} of {contracts}"
         reason = f"Price doubled ({entry_price}c → {bid}c). Freeroll: sell half, let rest ride to settlement."
-        print(f"  >>> {action}: {reason}")
+        logger.info("  >>> %s: %s", action, reason)
+        log_event(TradeEvent.MORNING_CHECK_DECISION, "morning_check", {
+            "ticker": ticker, "action": action, "rule": "freeroll", "bid": bid, "entry": entry_price,
+        })
         return {"ticker": ticker, "action": action, "reason": reason, "sell_qty": sell_qty, "price": bid}
 
     # Rule 2: Efficiency exit — price near max
     if bid >= 90:
         action = f"SELL ALL {contracts}"
         reason = f"Price at {bid}c — lock in 90%+ of max payout rather than risk settlement."
-        print(f"  >>> {action}: {reason}")
+        logger.info("  >>> %s: %s", action, reason)
+        log_event(TradeEvent.MORNING_CHECK_DECISION, "morning_check", {
+            "ticker": ticker, "action": action, "rule": "efficiency", "bid": bid,
+        })
         return {"ticker": ticker, "action": action, "reason": reason, "sell_qty": contracts, "price": bid}
 
     # Rule 3: Thesis broken — model shifted away
     if ensemble_prob < 0.10 and ensemble and ensemble.weighted_members:
         action = f"SELL ALL {contracts}"
         reason = f"Ensemble probability dropped to {ensemble_prob*100:.0f}%. Thesis broken."
-        print(f"  >>> {action}: {reason}")
+        logger.info("  >>> %s: %s", action, reason)
+        log_event(TradeEvent.MORNING_CHECK_DECISION, "morning_check", {
+            "ticker": ticker, "action": action, "rule": "thesis_broken", "kde_prob": round(ensemble_prob, 3),
+        })
         return {"ticker": ticker, "action": action, "reason": reason, "sell_qty": contracts, "price": bid}
 
     # Rule 4: NWS forecast far outside bracket
+    # Distance threshold scales with bracket width (2x bracket width, min 4°F)
     if nws_data:
         nws_h = nws_data.forecast_high
         if bracket_type == "range":
+            bracket_width = high - low
+            sell_distance = max(4, bracket_width * 2)
             bracket_mid = (low + high) / 2
             distance = abs(nws_h - bracket_mid)
-            if distance > 4:
+            if distance > sell_distance:
                 action = f"SELL ALL {contracts}"
                 reason = f"NWS forecast {nws_h:.0f}°F is {distance:.0f}°F from bracket center ({bracket_mid:.0f}°F)."
-                print(f"  >>> {action}: {reason}")
+                logger.info("  >>> %s: %s", action, reason)
+                log_event(TradeEvent.MORNING_CHECK_DECISION, "morning_check", {
+                    "ticker": ticker, "action": action, "rule": "nws_divergence",
+                    "nws_high": nws_h, "distance": round(distance, 1),
+                })
                 return {"ticker": ticker, "action": action, "reason": reason, "sell_qty": contracts, "price": bid}
 
     # Rule 5: Strong alignment — hold for settlement
@@ -262,14 +278,21 @@ async def check_position(
             action = "HOLD — LET SETTLE"
             reason = f"Ensemble {ensemble_prob*100:.0f}% + NWS agrees. {hours_to_settlement:.0f}h to settlement."
             payout = contracts  # $1 per contract
-            print(f"  >>> {action}: {reason}")
-            print(f"      Payout if correct: ${payout:.2f}")
+            logger.info("  >>> %s: %s (payout if correct: $%.2f)", action, reason, payout)
+            log_event(TradeEvent.MORNING_CHECK_DECISION, "morning_check", {
+                "ticker": ticker, "action": action, "rule": "strong_alignment",
+                "kde_prob": round(ensemble_prob, 3), "hours_to_settlement": hours_to_settlement,
+            })
             return {"ticker": ticker, "action": action, "reason": reason}
 
     # Default: cautious hold
     action = "HOLD (monitor)"
     reason = f"No strong signal. Ensemble: {ensemble_prob*100:.0f}%, Bid: {bid}c. Watch for changes."
-    print(f"  >>> {action}: {reason}")
+    logger.info("  >>> %s: %s", action, reason)
+    log_event(TradeEvent.MORNING_CHECK_DECISION, "morning_check", {
+        "ticker": ticker, "action": action, "rule": "default_hold",
+        "kde_prob": round(ensemble_prob, 3), "bid": bid,
+    })
     return {"ticker": ticker, "action": action, "reason": reason}
 
 
@@ -279,8 +302,7 @@ async def main(city_filter: str = None):
     open_positions = [p for p in positions if p["status"] == "open"]
 
     if not open_positions:
-        print(f"\n  MORNING CHECK — {now.strftime('%I:%M %p ET, %A %B %d')}")
-        print(f"  No open positions. Nothing to check.")
+        logger.info("MORNING CHECK — %s — No open positions.", now.strftime("%I:%M %p ET, %A %B %d"))
         return
 
     # Filter by city if specified
@@ -291,16 +313,13 @@ async def main(city_filter: str = None):
             if _city_key_from_ticker(p["ticker"]) == city_filter
         ]
         if not open_positions:
-            print(f"  No open positions for {city_filter}.")
+            logger.info("No open positions for %s.", city_filter)
             return
 
-    print(f"\n{'='*60}")
-    print(f"  MORNING CHECK — {now.strftime('%I:%M %p ET, %A %B %d')}")
-    print(f"  Open positions: {len(open_positions)}")
-    print(f"{'='*60}")
+    logger.info("MORNING CHECK — %s | %d open positions", now.strftime("%I:%M %p ET, %A %B %d"), len(open_positions))
 
     balance = await fetch_balance()
-    print(f"  Balance: ${balance:.2f}")
+    logger.info("Balance: $%.2f", balance)
 
     decisions = []
     async with aiohttp.ClientSession() as session:
@@ -309,7 +328,7 @@ async def main(city_filter: str = None):
                 decision = await check_position(session, pos, balance)
                 decisions.append(decision)
             except Exception as e:
-                print(f"  [ERR] Failed to check {pos['ticker']}: {e}")
+                logger.error("Failed to check %s: %s", pos["ticker"], e)
                 decisions.append({
                     "ticker": pos["ticker"],
                     "action": "MANUAL_CHECK",
@@ -317,18 +336,14 @@ async def main(city_filter: str = None):
                 })
 
     # ── Summary ──
-    print(f"\n{'='*60}")
-    print(f"  SUMMARY")
-    print(f"{'='*60}")
-
     sell_actions = [d for d in decisions if "SELL" in d.get("action", "")]
     hold_actions = [d for d in decisions if "HOLD" in d.get("action", "")]
     manual_actions = [d for d in decisions if "MANUAL" in d.get("action", "")]
 
+    logger.info("MORNING CHECK SUMMARY: %d sell, %d hold, %d manual",
+                len(sell_actions), len(hold_actions), len(manual_actions))
     for d in decisions:
-        icon = "🔴" if "SELL" in d["action"] else "🟢" if "HOLD" in d["action"] else "⚪"
-        print(f"  {icon} {d['ticker']}: {d['action']}")
-        print(f"     {d['reason']}")
+        logger.info("  %s: %s — %s", d["ticker"], d["action"], d["reason"])
 
     # Send Discord alert if any action items
     if sell_actions:
@@ -349,8 +364,11 @@ async def main(city_filter: str = None):
             context="morning_check",
         )
 
-    print(f"\n  Settlement: ~{SETTLEMENT_HOUR_ET}:00 AM ET")
-    print(f"{'='*60}\n")
+    logger.info("Settlement: ~%d:00 AM ET", SETTLEMENT_HOUR_ET)
+
+    # Record successful completion for watchdog
+    from heartbeat import write_heartbeat
+    write_heartbeat("morning_check")
 
 
 if __name__ == "__main__":

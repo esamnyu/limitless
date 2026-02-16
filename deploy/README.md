@@ -1,170 +1,240 @@
-# NYC Weather Arb Bot - HFT Deployment Guide
+# Weather Edge — Oracle Cloud Free Tier Deployment
 
-## TL;DR - Best VPS for Latency Arbitrage
+## Why Oracle Cloud?
+- **$0/month forever** (not a trial — truly always-free)
+- 4 ARM cores, 24 GB RAM, 200 GB storage
+- Ashburn, VA region: 5-15ms to Kalshi (same coast)
+- 99.9% uptime SLA
 
-| Provider | Region | Latency to Kalshi | Cost | Verdict |
-|----------|--------|-------------------|------|---------|
-| **AWS Free Tier** | us-east-1 (N. Virginia) | <5ms | Free 12mo | **BEST** |
-| Oracle Cloud | Ashburn, VA | 5-15ms | Free forever | Good backup |
-| DigitalOcean | NYC1/NJ | 5-10ms | $4/mo | Alternative |
-| Oracle Cloud | Other regions | 20-50ms | Free | Avoid |
+## What Gets Deployed
 
-**Why AWS wins:** Kalshi runs on AWS us-east-1. Same datacenter = <5ms latency.
+```
+CRON (6/8/10/15/23 ET)
+  auto_trader.py      → Scan + auto-execute 90+ confidence setups
+
+SYSTEMD TIMERS
+  position_monitor    → Every 5 min — exits, trailing stops, freeroll
+  watchdog            → Every 15 min — cron health checks
+
+CRON (one-shot daily)
+  morning_check       → 6:30 AM — pre-settlement position evaluation
+  backtest_collector  → 8:30 AM — settlement data collection
+```
 
 ---
 
-## Quick Deploy (AWS Free Tier)
+## Step-by-Step Setup
 
-### 1. Create AWS Account
-- Go to https://aws.amazon.com/free
-- Create account (requires credit card, won't be charged)
+### 1. Create Oracle Cloud Account
 
-### 2. Launch EC2 Instance
+1. Go to https://www.oracle.com/cloud/free/
+2. Sign up (credit card required for identity verification — never charged for free tier)
+3. Select **Home Region: US East (Ashburn)** — lowest latency to Kalshi
+
+### 2. Create ARM Instance
+
+In the Oracle Cloud Console:
+
 ```
-Region:        us-east-1 (N. Virginia) ← CRITICAL
-Instance Type: t2.micro (free tier)
-AMI:           Ubuntu 22.04 LTS
-Storage:       8GB (default)
-Security:      Allow SSH (port 22)
+Compute → Instances → Create Instance
+
+Name:           weather-edge
+Image:          Ubuntu 22.04 (or 24.04)
+Shape:          VM.Standard.A1.Flex (Ampere ARM)
+  OCPUs:        1 (free tier allows up to 4)
+  Memory:       6 GB (free tier allows up to 24 GB)
+Networking:     Create new VCN + public subnet
+  Public IP:    Yes
+Boot volume:    50 GB (free tier allows up to 200 GB)
+SSH key:        Paste your public key (~/.ssh/id_rsa.pub)
 ```
 
-### 3. Connect & Deploy
+> **Tip:** If you get "Out of host capacity," try a different Availability Domain
+> or try again later (ARM instances are popular). Scripts exist to auto-retry.
+
+### 3. Open SSH Port
+
+```
+Networking → Virtual Cloud Networks → [your VCN]
+  → Security Lists → Default → Ingress Rules
+  → Add: Source 0.0.0.0/0, TCP, Port 22
+```
+
+### 4. SSH In & Run Setup
+
 ```bash
-# SSH into instance
-ssh -i ~/your-key.pem ubuntu@<your-ec2-ip>
+# From your Mac
+ssh ubuntu@<oracle-instance-ip>
 
-# Clone repo
-git clone <your-repo-url> limitless
-cd limitless
-
-# Upload secrets (from local machine)
-scp -i ~/your-key.pem .env ubuntu@<ip>:~/limitless/
-scp -i ~/your-key.pem kalshi_private_key.pem ubuntu@<ip>:~/limitless/
-
-# Run deployment script
-chmod +x deploy/setup.sh
-./deploy/setup.sh
+# On the server — one-time setup
+mkdir -p ~/limitless
 ```
 
-### 4. Verify Latency
+### 5. Deploy Code
+
 ```bash
-source venv/bin/activate
-python3 deploy/latency_test.py
+# From your Mac (project root)
+chmod +x deploy/deploy.sh
+./deploy/deploy.sh <oracle-instance-ip> --full
 ```
 
-Expected on AWS us-east-1:
-```
-Kalshi API: ~3-5ms   ← OPTIMAL
-NWS XML:    ~20-40ms ← Good
-```
+This will:
+1. rsync all code (excluding secrets, .venv, positions.json)
+2. Upload `.env` and `kalshi_private_key.pem`
+3. Run `setup_oracle.sh` (installs Python, chrony, systemd services, cron)
+4. Run tests on server
+5. Smoke test the deployment
 
-### 5. Start Bot
+### 6. Verify
+
 ```bash
-# Paper trading (default)
-sudo systemctl start weather-arb
+ssh ubuntu@<ip>
+
+# Check cron
+crontab -l
+
+# Check timers
+systemctl list-timers --all | grep weather
+
+# Manual dry run
+cd ~/limitless
+source .venv/bin/activate
+python3 auto_trader.py --dry-run
 
 # Watch logs
-journalctl -u weather-arb -f
+tail -f /var/log/weather-edge/*.log
 ```
 
-### 6. Enable Live Trading
-```bash
-sudo nano /etc/systemd/system/weather-arb.service
-# Change: nyc_weather_arb.py --live
+### 7. Go Live
 
-sudo systemctl daemon-reload
-sudo systemctl restart weather-arb
+When you're satisfied with dry-run results:
+
+```bash
+# Edit crontab to remove --dry-run flags
+crontab -e
+# Change: auto_trader.py --dry-run  →  auto_trader.py
 ```
 
 ---
 
-## Latency Matters: The Math
+## Day-to-Day Operations
 
+### View logs
+```bash
+ssh ubuntu@<ip> 'tail -f /var/log/weather-edge/auto_trader.log'
+ssh ubuntu@<ip> 'tail -f /var/log/weather-edge/position_monitor.log'
 ```
-Scenario A: Your bot on AWS us-east-1
-├── NWS observation received
-├── Kalshi order sent: +3ms
-├── Order filled: +2ms
-└── Total: 5ms
 
-Scenario B: Your bot on Oracle (Phoenix, AZ)
-├── NWS observation received
-├── Kalshi order sent: +45ms (cross-country + cloud hop)
-├── Order filled: +2ms
-└── Total: 47ms
+### Emergency stop
+```bash
+ssh ubuntu@<ip> 'touch ~/limitless/PAUSE_TRADING'     # HALT
+ssh ubuntu@<ip> 'rm ~/limitless/PAUSE_TRADING'         # RESUME
+```
 
-Difference: 42ms
+### Push code updates
+```bash
+./deploy/deploy.sh <ip>           # Fast: code + deps + tests only
+./deploy/deploy.sh <ip> --secrets  # Upload just .env + key
+```
 
-In 42ms, another bot on AWS can:
-- See the same observation
-- Place their order
-- Get filled BEFORE you
+### Check positions
+```bash
+ssh ubuntu@<ip> 'cat ~/limitless/positions.json | python3 -m json.tool'
+```
+
+### Run a manual scan
+```bash
+ssh ubuntu@<ip> 'cd ~/limitless && source .venv/bin/activate && python3 auto_trader.py --dry-run --city NYC'
+```
+
+### Service status
+```bash
+ssh ubuntu@<ip> 'systemctl list-timers --all | grep weather'
+ssh ubuntu@<ip> 'crontab -l'
 ```
 
 ---
 
-## Monitoring Commands
+## Architecture on Server
 
-```bash
-# Service status
-sudo systemctl status weather-arb
-
-# Live logs
-journalctl -u weather-arb -f
-
-# Today's trades
-cat nyc_arb_trades.jsonl | tail -20
-
-# Check max temp tracking
-cat nyc_daily_max_temp.json
-
-# Time sync status
-chronyc tracking
-
-# Restart bot
-sudo systemctl restart weather-arb
 ```
+/home/ubuntu/limitless/
+├── .env                    # Secrets (never rsync'd)
+├── .venv/                  # Python venv
+├── kalshi_private_key.pem  # RSA key (chmod 600)
+├── positions.json          # Live positions (auto-created)
+├── config.py               # All settings
+├── auto_trader.py          # Main scan+trade loop (cron)
+├── position_monitor.py     # Exit rules (systemd timer)
+├── watchdog.py             # Health checks (systemd timer)
+├── morning_check.py        # Pre-settlement (cron)
+├── backtest_collector.py   # Data collection (cron)
+├── edge_scanner_v2.py      # KDE + ensemble scanner
+├── kalshi_client.py        # API client
+├── execute_trade.py        # Order execution
+├── position_store.py       # Atomic file store
+├── trading_guards.py       # Safety checks
+├── notifications.py        # Discord alerts
+└── deploy/
+    ├── setup_oracle.sh     # One-time server setup
+    ├── deploy.sh           # Push code updates
+    └── .env.example        # Template
+
+/var/log/weather-edge/
+├── auto_trader.log
+├── position_monitor.log
+├── watchdog.log
+├── backtest_collector.log
+└── morning_check.log       # 14-day rotation
+```
+
+---
+
+## Cost Comparison
+
+| Provider | Spec | Latency to Kalshi | Cost |
+|----------|------|-------------------|------|
+| **Oracle Cloud (Ashburn)** | 1 ARM core, 6 GB | 5-15ms | **$0/mo forever** |
+| AWS EC2 t3.micro | 2 vCPU, 1 GB | <5ms | $0 for 12mo, then $8/mo |
+| DigitalOcean (NYC) | 1 vCPU, 1 GB | 5-10ms | $6/mo |
+| Vultr (NJ) | 1 vCPU, 1 GB | 5-10ms | $5/mo |
+
+Oracle Ashburn is the best option: zero cost, sufficient specs, acceptable latency.
+Latency doesn't matter much for this system — we place limit orders at scan time
+(5x daily), not HFT. 10ms vs 5ms is irrelevant for a cron-based scanner.
 
 ---
 
 ## Troubleshooting
 
-### Bot crashes on startup
-```bash
-# Check logs for error
-journalctl -u weather-arb -n 50
+### "Out of host capacity" when creating instance
+ARM instances are popular. Solutions:
+- Try a different Availability Domain (AD-1, AD-2, AD-3)
+- Try during off-peak hours (early morning US time)
+- Use an auto-retry script: search "oracle cloud instance creation script"
 
-# Common fixes:
-# 1. Missing .env file
-# 2. Wrong path to private key
-# 3. Python package missing
+### Tests fail on server
+```bash
+ssh ubuntu@<ip> 'cd ~/limitless && source .venv/bin/activate && python3 -m pytest tests/ -v'
+```
+Common issues: missing numpy on ARM (install via apt: `sudo apt install python3-numpy`)
+
+### Discord alerts not working
+```bash
+ssh ubuntu@<ip> 'grep DISCORD ~/limitless/.env'
+# Verify webhook URL is set
 ```
 
-### High latency to Kalshi
+### Cron jobs not running
 ```bash
-# Run latency test
-python3 deploy/latency_test.py
-
-# If >50ms, you're in wrong region
-# Redeploy to us-east-1
+ssh ubuntu@<ip> 'grep CRON /var/log/syslog | tail -20'
+# Check timezone
+ssh ubuntu@<ip> 'timedatectl'
 ```
 
-### Time sync issues
+### Position monitor not running
 ```bash
-sudo chronyc makestep
-chronyc tracking
+ssh ubuntu@<ip> 'systemctl status weather-edge-monitor.timer'
+ssh ubuntu@<ip> 'systemctl status weather-edge-monitor.service'
+ssh ubuntu@<ip> 'journalctl -u weather-edge-monitor -n 20'
 ```
-
----
-
-## Cost After Free Tier Expires
-
-| Option | Monthly Cost |
-|--------|--------------|
-| AWS t3.micro (on-demand) | ~$8/mo |
-| AWS t3.micro (1yr reserved) | ~$4/mo |
-| Oracle Cloud (always free) | $0 |
-| Vultr NYC | $5/mo |
-| DigitalOcean NYC | $4/mo |
-
-**Recommendation:** Use AWS free tier for 12 months, then switch to Oracle Ashburn or a cheap NYC VPS.

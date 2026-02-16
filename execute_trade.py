@@ -30,6 +30,7 @@ Safety:
 
 import argparse
 import asyncio
+import json
 import os
 import sys
 from datetime import datetime
@@ -40,9 +41,12 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
+from log_setup import get_logger
 from kalshi_client import KalshiClient
 from position_store import register_position
 from notifications import send_discord_alert
+
+logger = get_logger(__name__)
 
 ET = ZoneInfo("America/New_York")
 
@@ -61,7 +65,7 @@ async def send_discord_confirmation(ticker: str, side: str, price: int, qty: int
         description=(
             f"**{side.upper()} {ticker}**\n"
             f"Price: {price}¢ | Qty: {qty} | Cost: ${cost:.2f}\n"
-            f"Max Payout: ${qty:.2f}\n"
+            f"Max Payout: ${qty:.2f} | Profit: ${qty - cost:.2f}\n"
             f"Time: {now}"
         ),
         color=color,
@@ -163,6 +167,25 @@ async def execute(ticker: str, side: str, price: int, quantity: int, confirm: bo
             print(f"\n  ⚠ Your bid ({price}¢) is AT/ABOVE the ask ({ob_yes_ask}¢).")
             print(f"    You'll pay taker fees. Consider bidding {max(1, ob_yes_ask - 1)}¢.")
 
+        # Check if this would average into an existing position
+        try:
+            from position_store import load_positions
+            existing = [p for p in load_positions()
+                        if p.get("ticker") == ticker and p.get("side") == side
+                        and p.get("status") == "open"]
+            if existing:
+                ep = existing[0]
+                old_qty = ep.get("contracts", 0)
+                old_price = ep.get("avg_price", 0)
+                new_total = old_qty + quantity
+                new_avg = round((old_price * old_qty + price * quantity) / new_total, 1)
+                direction = "DOWN" if price < old_price else "UP"
+                print(f"\n  ⚠ AVERAGING {direction} — existing position detected!")
+                print(f"    Current: {old_qty}x @ {old_price:.0f}¢")
+                print(f"    After:   {new_total}x @ {new_avg:.0f}¢ (adding {quantity}x @ {price}¢)")
+        except Exception as e:
+            logger.warning("Advisory position check failed: %s", e)
+
         # ── Confirm ──
         if not confirm:
             response = input(f"\n  Execute this trade? (y/n): ").strip().lower()
@@ -184,7 +207,31 @@ async def execute(ticker: str, side: str, price: int, quantity: int, confirm: bo
         if result:
             order = result.get("order", result)
             status = order.get("status", "unknown").upper()
-            order_id = order.get("order_id", "N/A")
+            order_id = order.get("order_id", "")
+
+            # ── Verify order was actually accepted before registering ──
+            if not order_id or order_id == "N/A":
+                print(f"  ✗ Order response missing order_id — NOT registering position")
+                print(f"    Raw response: {json.dumps(result, default=str)[:300]}")
+                await send_discord_alert(
+                    title="⚠ ORDER MISSING ID — Position NOT registered",
+                    description=(
+                        f"Kalshi returned a response without order_id.\n"
+                        f"**{side.upper()} {ticker}** — {quantity}x @ {price}c\n"
+                        f"Status: {status}\n"
+                        f"**Check Kalshi dashboard for orphaned orders.**"
+                    ),
+                    color=0xFF0000,
+                    context="missing_order_id",
+                )
+                return False
+
+            REJECTED_STATUSES = {"REJECTED", "CANCELED", "CANCELLED", "FAILED", "ERROR"}
+            if status in REJECTED_STATUSES:
+                print(f"  ✗ Order REJECTED by Kalshi (status: {status})")
+                print(f"     Order ID: {order_id}")
+                await send_discord_confirmation(ticker, side, price, quantity, total_cost, status)
+                return False
 
             if status in ("RESTING", "PENDING"):
                 print(f"  ⏳ Order RESTING (limit order in book)")
@@ -197,8 +244,25 @@ async def execute(ticker: str, side: str, price: int, quantity: int, confirm: bo
                 print(f"  Order status: {status}")
                 print(f"     Order ID: {order_id}")
 
-            # Register position for the position monitor to track
-            register_position(ticker, side, price, quantity, order_id, status)
+            # Register position for the position monitor to track.
+            # Critical: if this fails, we have an orphaned order on Kalshi
+            # that position_monitor can't see. Log loudly + Discord alert.
+            try:
+                register_position(ticker, side, price, quantity, order_id, status)
+            except Exception as reg_err:
+                print(f"  ⚠ CRITICAL: Order placed but register_position failed: {reg_err}")
+                print(f"    Orphaned order: {order_id} — {quantity}x {side} {ticker} @ {price}c")
+                await send_discord_alert(
+                    title="🚨 ORPHANED ORDER — register_position FAILED",
+                    description=(
+                        f"Order {order_id} placed successfully but position tracking failed.\n"
+                        f"**{side.upper()} {ticker}** — {quantity}x @ {price}c\n"
+                        f"Error: {reg_err}\n"
+                        f"**Manual action required:** Add to positions.json or cancel order."
+                    ),
+                    color=0xFF0000,
+                    context="orphaned_order",
+                )
 
             await send_discord_confirmation(ticker, side, price, quantity, total_cost, status)
             return True
@@ -209,6 +273,118 @@ async def execute(ticker: str, side: str, price: int, quantity: int, confirm: bo
 
     finally:
         await client.stop()
+
+
+async def execute_auto(
+    ticker: str, side: str, price: int, quantity: int,
+    client: KalshiClient = None, close_client: bool = False,
+) -> dict:
+    """Non-interactive trade execution for auto_trader.py.
+
+    Caller is responsible for safety checks (trading_guards).
+    Accepts optional KalshiClient to avoid reconnection overhead.
+
+    Returns:
+        {"success": bool, "order_id": str, "status": str, "cost": float, "error": str}
+    """
+    side = side.lower()
+    if side not in ("yes", "no"):
+        return {"success": False, "order_id": "", "status": "", "cost": 0, "error": f"Invalid side: {side}"}
+    if price < 1 or price > 99:
+        return {"success": False, "order_id": "", "status": "", "cost": 0, "error": f"Invalid price: {price}"}
+    if side == "yes" and price > MAX_ENTRY_PRICE:
+        return {"success": False, "order_id": "", "status": "", "cost": 0, "error": f"Price {price}c > MAX {MAX_ENTRY_PRICE}c"}
+    if quantity < 1:
+        return {"success": False, "order_id": "", "status": "", "cost": 0, "error": f"Invalid quantity: {quantity}"}
+
+    own_client = False
+    if client is None:
+        api_key = os.getenv("KALSHI_API_KEY_ID")
+        pk_path = os.getenv("KALSHI_PRIVATE_KEY_PATH")
+        if not api_key or not pk_path:
+            return {"success": False, "order_id": "", "status": "", "cost": 0, "error": "Missing credentials"}
+        client = KalshiClient(api_key_id=api_key, private_key_path=pk_path, demo_mode=False)
+        await client.start()
+        own_client = True
+
+    try:
+        balance = await client.get_balance()
+        total_cost = (price / 100) * quantity
+        max_allowed = balance * MAX_POSITION_PCT
+
+        if total_cost > max_allowed:
+            return {"success": False, "order_id": "", "status": "", "cost": total_cost,
+                    "error": f"Cost ${total_cost:.2f} > {MAX_POSITION_PCT*100:.0f}% NLV (${max_allowed:.2f})"}
+        if total_cost > balance:
+            return {"success": False, "order_id": "", "status": "", "cost": total_cost,
+                    "error": f"Insufficient balance: ${balance:.2f}"}
+
+        result = await client.place_order(
+            ticker=ticker, side=side, action="buy",
+            count=quantity, price=price, order_type="limit",
+        )
+
+        if result:
+            order = result.get("order", result)
+            status = order.get("status", "unknown").upper()
+            order_id = order.get("order_id", "")
+
+            # ── Verify order was actually accepted before registering ──
+            if not order_id:
+                logger.error("Order response missing order_id — NOT registering position")
+                await send_discord_alert(
+                    title="⚠ ORDER MISSING ID — Position NOT registered",
+                    description=(
+                        f"Kalshi returned a response without order_id.\n"
+                        f"**{side.upper()} {ticker}** — {quantity}x @ {price}c\n"
+                        f"Status: {status}\n"
+                        f"**Check Kalshi dashboard for orphaned orders.**"
+                    ),
+                    color=0xFF0000,
+                    context="missing_order_id",
+                )
+                return {"success": False, "order_id": "", "status": status, "cost": total_cost,
+                        "error": "Order response missing order_id"}
+
+            REJECTED_STATUSES = {"REJECTED", "CANCELED", "CANCELLED", "FAILED", "ERROR"}
+            if status in REJECTED_STATUSES:
+                logger.warning("Order REJECTED by Kalshi (status: %s, order: %s)", status, order_id)
+                return {"success": False, "order_id": order_id, "status": status, "cost": total_cost,
+                        "error": f"Order rejected: {status}"}
+
+            # Critical: protect against register_position failure leaving orphaned orders
+            try:
+                register_position(ticker, side, price, quantity, order_id, status)
+            except Exception as reg_err:
+                logger.error(
+                    "ORPHANED ORDER: %s placed but register_position failed: %s",
+                    order_id, reg_err,
+                )
+                await send_discord_alert(
+                    title="🚨 ORPHANED ORDER — register_position FAILED",
+                    description=(
+                        f"Order {order_id} placed but position tracking failed.\n"
+                        f"**{side.upper()} {ticker}** — {quantity}x @ {price}c\n"
+                        f"Error: {reg_err}\n"
+                        f"**Manual action required:** Add to positions.json or cancel order."
+                    ),
+                    color=0xFF0000,
+                    context="orphaned_order",
+                )
+
+            await send_discord_confirmation(ticker, side, price, quantity, total_cost, status)
+            return {"success": True, "order_id": order_id, "status": status, "cost": total_cost, "error": ""}
+        else:
+            await send_discord_confirmation(ticker, side, price, quantity, total_cost, "FAILED")
+            return {"success": False, "order_id": "", "status": "FAILED", "cost": total_cost,
+                    "error": "Order placement returned empty result"}
+
+    except Exception as e:
+        return {"success": False, "order_id": "", "status": "ERROR", "cost": 0, "error": str(e)}
+
+    finally:
+        if own_client or close_client:
+            await client.stop()
 
 
 if __name__ == "__main__":

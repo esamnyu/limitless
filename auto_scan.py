@@ -4,7 +4,7 @@ AUTO SCAN — Automated Edge Scanner with Discord Alerts
 
 Runs edge_scanner_v2 at scheduled intervals, captures output,
 and sends Discord webhook alerts when:
-  1. A tradeable opportunity (90+ confidence) is found
+  1. A tradeable opportunity is found (TradeScore gate when enabled, else confidence ≥ 90)
   2. An existing position needs attention (morning check)
   3. Market conditions change significantly between scans
 
@@ -31,7 +31,6 @@ import argparse
 import asyncio
 import io
 import os
-import sys
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -46,23 +45,60 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 from edge_scanner_v2 import (
     CITIES,
     MIN_CONFIDENCE_TO_TRADE,
-    EnsembleV2,
-    NWSData,
     Opportunity,
     analyze_opportunities_v2,
     fetch_ensemble_v2,
     fetch_kalshi_brackets,
     fetch_nws,
-    get_entry_timing,
-    kde_probability,
     compute_confidence_score,
     shorten_bracket_title,
 )
+from config import TRADE_SCORE_ENABLED, TRADE_SCORE_THRESHOLD, SETTLEMENT_HOUR_ET, STALE_PRICE_ENABLED
 from notifications import send_discord_embeds
+from trade_score import should_trade
+from stale_price_detector import (
+    load_previous_state,
+    save_current_state,
+    build_snapshot,
+    detect_stale_prices,
+    format_stale_alerts,
+)
+from log_setup import get_logger
+from trade_events import log_event, TradeEvent
+
+logger = get_logger(__name__)
 
 ET = ZoneInfo("America/New_York")
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 SCAN_LOG_DIR = os.path.join(PROJECT_ROOT, "scan_logs")
+
+
+def _is_tradeable(opp, hours_to_settlement: float = 14.0) -> bool:
+    """Unified tradeable check: uses trade score when enabled, else legacy 90-gate."""
+    if TRADE_SCORE_ENABLED:
+        return should_trade(opp, hours_to_settlement)
+    return opp.confidence_score >= MIN_CONFIDENCE_TO_TRADE
+
+
+def _hours_to_settlement() -> float:
+    """Compute hours until the next settlement.
+
+    If we're before today's settlement hour, target today.
+    If we're past it, target tomorrow.  This prevents the 6 AM scan
+    from returning ~25 h (tomorrow) when settlement is actually ~1 h away (today).
+    """
+    now = datetime.now(ET)
+    today_settle = datetime.combine(now.date(), datetime.min.time()).replace(
+        hour=SETTLEMENT_HOUR_ET, tzinfo=ET,
+    )
+    if now < today_settle:
+        settlement_dt = today_settle
+    else:
+        tomorrow = now.date() + timedelta(days=1)
+        settlement_dt = datetime.combine(tomorrow, datetime.min.time()).replace(
+            hour=SETTLEMENT_HOUR_ET, tzinfo=ET,
+        )
+    return max(0.5, (settlement_dt - now).total_seconds() / 3600)
 
 
 def format_discord_alert(
@@ -71,21 +107,28 @@ def format_discord_alert(
     balance: float,
     scan_time: str,
     failed_cities: list[dict] = None,
+    hours_to_settlement: float = 14.0,
 ) -> list[dict]:
     """Format scan results into Discord embed messages."""
     embeds = []
     failed_cities = failed_cities or []
 
-    tradeable = [o for o in all_opps if o.confidence_score >= MIN_CONFIDENCE_TO_TRADE]
+    h2s = hours_to_settlement
+    tradeable = [o for o in all_opps if _is_tradeable(o, h2s)]
 
     # Header embed
     color = 0x00FF00 if tradeable else 0xFFAA00 if all_opps else 0xFF0000
     status = f"🎯 {len(tradeable)} TRADEABLE" if tradeable else f"👀 {len(all_opps)} opportunities (observe)"
 
+    gate_label = (
+        f"TradeScore≥{TRADE_SCORE_THRESHOLD} ({h2s:.0f}h to settle)"
+        if TRADE_SCORE_ENABLED
+        else f"{MIN_CONFIDENCE_TO_TRADE}+ confidence required"
+    )
     header_desc = (
         f"**{status}**\n"
         f"Balance: ${balance:.2f} | Cities: {len(city_summaries)}\n"
-        f"Gate: {MIN_CONFIDENCE_TO_TRADE}+ confidence required"
+        f"Gate: {gate_label}"
     )
 
     if failed_cities:
@@ -111,11 +154,12 @@ def format_discord_alert(
             for opp in cs["opps"][:3]:  # Top 3 per city
                 price = opp.yes_bid if opp.side == "yes" else (100 - opp.yes_ask)
                 short = shorten_bracket_title(opp.bracket_title)
-                icon = "🎯" if opp.confidence_score >= MIN_CONFIDENCE_TO_TRADE else "👀"
+                icon = "🎯" if _is_tradeable(opp, h2s) else "👀"
+                ts_txt = f" TS:{opp.trade_score:.3f}" if TRADE_SCORE_ENABLED and hasattr(opp, "trade_score") and opp.trade_score else ""
                 city_text += (
                     f"{icon} {opp.side.upper()} {short} @ {price}¢ "
                     f"(KDE:{opp.kde_prob*100:.0f}% edge:{opp.edge_after_fees*100:+.0f}¢ "
-                    f"conf:{opp.confidence_score:.0f})\n"
+                    f"conf:{opp.confidence_score:.0f}{ts_txt})\n"
                 )
         else:
             city_text += "No opportunities above threshold.\n"
@@ -123,7 +167,7 @@ def format_discord_alert(
         embeds.append({
             "title": f"📍 {cs['name']}",
             "description": city_text,
-            "color": 0x00FF00 if any(o.confidence_score >= MIN_CONFIDENCE_TO_TRADE for o in cs.get("opps", [])) else 0x808080,
+            "color": 0x00FF00 if any(_is_tradeable(o, h2s) for o in cs.get("opps", [])) else 0x808080,
         })
 
     # Tradeable alert (if any)
@@ -136,11 +180,15 @@ def format_discord_alert(
             display_price = opp.yes_bid if opp.side == "yes" else (100 - opp.yes_ask)
             short = shorten_bracket_title(opp.bracket_title)
             cost = entry_price / 100 * opp.suggested_contracts
+            ts_line = ""
+            if TRADE_SCORE_ENABLED and hasattr(opp, "trade_score") and opp.trade_score:
+                ts_line = f"TradeScore: {opp.trade_score:.3f} (threshold: {TRADE_SCORE_THRESHOLD})\n"
             alert_text += (
                 f"**{opp.city} — {opp.side.upper()} {short} @ {display_price}¢**\n"
                 f"KDE: {opp.kde_prob*100:.1f}% | Edge: {opp.edge_after_fees*100:+.1f}¢ | "
                 f"Kelly: {opp.suggested_contracts} contracts\n"
                 f"Confidence: {opp.confidence} ({opp.confidence_score:.0f}/100)\n"
+                f"{ts_line}"
                 f"Rationale: {opp.rationale}\n"
                 f"**Execute:** `python3 execute_trade.py {opp.ticker} {opp.side} {entry_price} {opp.suggested_contracts}`\n"
                 f"Cost: ${cost:.2f} | Payout: ${opp.suggested_contracts:.2f}\n\n"
@@ -159,9 +207,8 @@ async def run_scan(city_filter: str = None, quiet: bool = False, dry_run: bool =
     """Run the full scan and send alerts."""
     now = datetime.now(ET)
     scan_time = now.strftime("%I:%M %p ET, %a %b %d")
-    print(f"\n{'='*60}")
-    print(f"  AUTO SCAN — {scan_time}")
-    print(f"{'='*60}")
+    logger.info("AUTO SCAN — %s", scan_time)
+    log_event(TradeEvent.SCAN_STARTED, "auto_scan", {"scan_time": scan_time, "city_filter": city_filter})
 
     # Get balance
     balance = 0.0
@@ -169,12 +216,22 @@ async def run_scan(city_filter: str = None, quiet: bool = False, dry_run: bool =
         from kalshi_client import fetch_balance_quick
         balance = await fetch_balance_quick()
     except Exception as e:
-        print(f"  [WARN] Balance: {e}")
+        logger.warning("Balance fetch failed: %s", e)
 
-    cities_to_scan = {city_filter.upper(): CITIES[city_filter.upper()]} if city_filter else CITIES
+    if city_filter:
+        city_key_upper = city_filter.upper()
+        if city_key_upper not in CITIES:
+            valid = ", ".join(sorted(CITIES))
+            logger.error("Unknown city '%s'. Valid: %s", city_filter, valid)
+            return {"scan_time": scan_time, "balance": balance, "total_opps": 0,
+                    "tradeable": 0, "opps": [], "city_summaries": [], "log_file": ""}
+        cities_to_scan = {city_key_upper: CITIES[city_key_upper]}
+    else:
+        cities_to_scan = CITIES
 
-    tomorrow = (datetime.now(ET) + timedelta(days=1)).date()
+    tomorrow = (now + timedelta(days=1)).date()
     target_date_str = tomorrow.isoformat()
+    h2s = _hours_to_settlement()
 
     all_opps = []
     city_summaries = []
@@ -182,7 +239,7 @@ async def run_scan(city_filter: str = None, quiet: bool = False, dry_run: bool =
 
     async with aiohttp.ClientSession() as session:
         for city_key in cities_to_scan:
-            print(f"  Scanning {city_key}...", end=" ")
+            logger.info("Scanning %s...", city_key)
 
             try:
                 ens_task = fetch_ensemble_v2(session, city_key, target_date_str)
@@ -216,8 +273,32 @@ async def run_scan(city_filter: str = None, quiet: bool = False, dry_run: bool =
                         "conf_score": conf_score,
                     }
                     save_ensemble_snapshot(city_key, datetime.combine(tomorrow, datetime.min.time()), snapshot_data)
-                except Exception:
-                    pass  # Non-critical — don't break scan if snapshot fails
+                except Exception as snap_err:
+                    logger.warning("Snapshot save failed for %s: %s", city_key, snap_err)
+
+                # Save calibration record (richer snapshot for prediction→outcome loop)
+                try:
+                    from calibration_tracker import save_calibration_record
+                    from trade_score import compute_trade_score
+                    city_trade_scores = [compute_trade_score(o, h2s) for o in opps]
+                    cal_scan_result = {
+                        "mean": ensemble.mean,
+                        "std": ensemble.std,
+                        "total_count": ensemble.total_count,
+                        "kde_bandwidth": getattr(ensemble, "kde_bandwidth", None),
+                        "per_model_means": {mg.name: mg.mean for mg in ensemble.models},
+                        "per_model_stds": {mg.name: mg.std for mg in ensemble.models},
+                        "per_model_counts": {mg.name: mg.count for mg in ensemble.models},
+                        "nws_forecast_high": nws_data.forecast_high,
+                        "nws_physics_high": nws_data.physics_high,
+                        "nws_current_temp": nws_data.current_temp,
+                        "nws_wind_penalty": getattr(nws_data, "wind_penalty", 0),
+                        "nws_wet_bulb_penalty": getattr(nws_data, "wet_bulb_penalty", 0),
+                        "nws_temp_trend": getattr(nws_data, "temp_trend", None),
+                    }
+                    save_calibration_record(city_key, cal_scan_result, opps, city_trade_scores, h2s)
+                except Exception as cal_err:
+                    logger.warning("Calibration record save failed for %s: %s", city_key, cal_err)
 
                 city_summaries.append({
                     "name": CITIES[city_key]["name"],
@@ -227,29 +308,74 @@ async def run_scan(city_filter: str = None, quiet: bool = False, dry_run: bool =
                     "members": ensemble.total_count,
                     "nws_high": nws_data.forecast_high,
                     "physics": nws_data.physics_high,
+                    "current_temp": nws_data.current_temp,
+                    "temp_trend": nws_data.temp_trend,
                     "conf_label": conf_label,
                     "conf_score": conf_score,
                     "opps": opps,
                 })
 
-                tradeable_count = sum(1 for o in opps if o.confidence_score >= MIN_CONFIDENCE_TO_TRADE)
-                print(f"✓ {ensemble.total_count} members, {len(opps)} opps ({tradeable_count} tradeable)")
+                tradeable_count = sum(1 for o in opps if _is_tradeable(o, h2s))
+                logger.info("  %s: %d members, %d opps (%d tradeable)",
+                            city_key, ensemble.total_count, len(opps), tradeable_count)
+                log_event(TradeEvent.SCAN_CITY_COMPLETE, "auto_scan", {
+                    "city": city_key, "members": ensemble.total_count,
+                    "opps": len(opps), "tradeable": tradeable_count,
+                    "mean": round(ensemble.mean, 1), "std": round(ensemble.std, 2),
+                    "conf_score": round(conf_score, 1),
+                })
 
             except Exception as e:
                 failed_cities.append({"city": city_key, "error": str(e)})
-                print(f"✗ FAILED — {e}")
+                logger.error("  %s: FAILED — %s", city_key, e)
+                log_event(TradeEvent.SCAN_CITY_FAILED, "auto_scan", {
+                    "city": city_key, "error": str(e),
+                })
                 continue
 
     if failed_cities:
         failed_names = [f["city"] for f in failed_cities]
         scanned_count = len(cities_to_scan) - len(failed_cities)
-        print(f"\n  ⚠ {len(failed_cities)} city scan(s) failed: {', '.join(failed_names)}")
-        print(f"  {scanned_count}/{len(cities_to_scan)} cities scanned successfully")
+        logger.warning("%d city scan(s) failed: %s (%d/%d succeeded)",
+                       len(failed_cities), ", ".join(failed_names),
+                       scanned_count, len(cities_to_scan))
+
+    # ── Stale Price Detection ──
+    stale_alerts = []
+    if STALE_PRICE_ENABLED:
+        prev_state = load_previous_state()
+        curr_state = {}
+        for cs in city_summaries:
+            city_key = cs["key"]
+            # Rebuild bracket data from the scan (we need raw brackets per city)
+            # The city_summaries have opps but not raw brackets, so build from opps
+            bracket_bids = {}
+            for opp in cs.get("opps", []):
+                bracket_bids[opp.ticker] = {
+                    "bid": opp.yes_bid,
+                    "title": opp.bracket_title,
+                }
+            snapshot = build_snapshot(city_key, cs["mean"], cs["std"], [])
+            # Override bracket_bids from opportunity data (more complete)
+            snapshot.bracket_bids = bracket_bids
+            curr_state[city_key] = snapshot
+
+            # Detect stale prices for this city
+            city_alerts = detect_stale_prices(city_key, snapshot, prev_state.get(city_key))
+            stale_alerts.extend(city_alerts)
+
+        save_current_state(curr_state)
+
+        if stale_alerts:
+            logger.info("STALE PRICES: %d bracket(s) may not have repriced", len(stale_alerts))
+            for sa in stale_alerts[:3]:
+                logger.info("  %s %s: mean shifted %+.1f°F, bid delta %+d¢",
+                            sa.city, sa.ticker, sa.mean_shift_f, sa.actual_bid - sa.prev_bid)
 
     # Summary
-    tradeable = [o for o in all_opps if o.confidence_score >= MIN_CONFIDENCE_TO_TRADE]
-    print(f"\n  Total: {len(all_opps)} opportunities, {len(tradeable)} tradeable")
-    print(f"  Balance: ${balance:.2f}")
+    tradeable = [o for o in all_opps if _is_tradeable(o, h2s)]
+    logger.info("Total: %d opportunities, %d tradeable | Balance: $%.2f",
+                len(all_opps), len(tradeable), balance)
 
     # Save scan log
     os.makedirs(SCAN_LOG_DIR, exist_ok=True)
@@ -272,20 +398,42 @@ async def run_scan(city_filter: str = None, quiet: bool = False, dry_run: bool =
             for opp in cs["opps"]:
                 price = opp.yes_bid if opp.side == "yes" else (100 - opp.yes_ask)
                 short = shorten_bracket_title(opp.bracket_title)
-                gate = "★" if opp.confidence_score >= MIN_CONFIDENCE_TO_TRADE else " "
+                gate = "★" if _is_tradeable(opp, h2s) else " "
+                ts_log = f" TS:{opp.trade_score:.3f}" if TRADE_SCORE_ENABLED and hasattr(opp, "trade_score") and opp.trade_score else ""
                 f.write(f"  {gate} {opp.side.upper()} {short} @ {price}¢ | "
                         f"KDE:{opp.kde_prob*100:.0f}% edge:{opp.edge_after_fees*100:+.0f}¢ "
-                        f"conf:{opp.confidence_score:.0f}\n")
+                        f"conf:{opp.confidence_score:.0f}{ts_log}\n")
         f.write(f"\n{summary_output}")
 
-    print(f"  Log saved: {log_file}")
+    logger.info("Log saved: %s", log_file)
 
     # Send Discord alert
-    if quiet and not tradeable:
-        print("  [QUIET] No tradeable opportunities — skipping Discord alert")
+    if quiet and not tradeable and not stale_alerts:
+        logger.info("Quiet mode — no tradeable opportunities, skipping Discord alert")
     else:
-        embeds = format_discord_alert(all_opps, city_summaries, balance, scan_time, failed_cities)
+        embeds = format_discord_alert(all_opps, city_summaries, balance, scan_time, failed_cities, h2s)
+
+        # Add stale price alert embed if any
+        if stale_alerts:
+            stale_text = format_stale_alerts(stale_alerts)
+            if stale_text:
+                embeds.append({
+                    "title": "📊 STALE PRICE DETECTION",
+                    "description": stale_text[:4096],
+                    "color": 0xFF6600,
+                })
+
         await send_discord_embeds(embeds, dry_run=dry_run, context="auto_scan")
+
+    log_event(TradeEvent.SCAN_COMPLETE, "auto_scan", {
+        "total_opps": len(all_opps), "tradeable": len(tradeable),
+        "cities_scanned": len(city_summaries), "cities_failed": len(failed_cities),
+        "stale_alerts": len(stale_alerts), "balance": round(balance, 2),
+    })
+
+    # Record successful completion for watchdog
+    from heartbeat import write_heartbeat
+    write_heartbeat("auto_scan")
 
     # Return results for programmatic use
     return {
@@ -294,6 +442,7 @@ async def run_scan(city_filter: str = None, quiet: bool = False, dry_run: bool =
         "total_opps": len(all_opps),
         "tradeable": len(tradeable),
         "opps": all_opps,
+        "city_summaries": city_summaries,
         "log_file": log_file,
     }
 

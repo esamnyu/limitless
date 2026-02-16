@@ -135,6 +135,9 @@ async def fetch_settlement_results(session: aiohttp.ClientSession, city_key: str
                     "result": m.get("result", ""),
                     "yes_bid_close": m.get("yes_bid", 0),
                     "volume": m.get("volume", 0),
+                    "floor_strike": m.get("floor_strike"),
+                    "cap_strike": m.get("cap_strike"),
+                    "strike_type": m.get("strike_type", ""),
                 })
 
         return results
@@ -166,6 +169,41 @@ def save_ensemble_snapshot(city_key: str, date: datetime, data: dict):
         logger.error(f"Failed to save snapshot: {e}")
 
 
+def derive_actual_high_from_settlements(settlements: List[Dict]) -> Optional[float]:
+    """
+    Derive actual high temperature from Kalshi settlement results.
+
+    This is the GROUND TRUTH — what Kalshi actually uses to settle markets.
+    Much more reliable than NWS observation API which uses different stations.
+
+    Priority:
+      1. Winning bracket (between type): midpoint of floor/cap strikes
+      2. Winning threshold >X (greater): floor_strike + 1 (conservative)
+      3. Winning threshold <X (less): cap_strike - 1 (conservative)
+    """
+    winners = [s for s in settlements if s.get("result") == "yes"]
+    if not winners:
+        return None
+
+    # Prefer bracket winners (most precise)
+    for w in winners:
+        if w.get("strike_type") == "between":
+            floor_s = w.get("floor_strike")
+            cap_s = w.get("cap_strike")
+            if floor_s is not None and cap_s is not None:
+                return (floor_s + cap_s) / 2.0
+
+    # Threshold winners
+    for w in winners:
+        stype = w.get("strike_type", "")
+        if stype == "greater" and w.get("floor_strike") is not None:
+            return float(w["floor_strike"] + 1)
+        elif stype == "less" and w.get("cap_strike") is not None:
+            return float(w["cap_strike"] - 1)
+
+    return None
+
+
 async def collect_daily_data(target_date: datetime = None):
     """
     Collect settlement data for a given date (default: yesterday).
@@ -190,10 +228,15 @@ async def collect_daily_data(target_date: datetime = None):
             print(f"  {city_key}...", end=" ")
 
             try:
-                # Fetch actual high and settlement results in parallel
-                actual_task = fetch_actual_high(session, city_key, target_date)
+                # Fetch NWS observation and settlement results in parallel
+                nws_task = fetch_actual_high(session, city_key, target_date)
                 settle_task = fetch_settlement_results(session, city_key, target_date)
-                actual_high, settlements = await asyncio.gather(actual_task, settle_task)
+                nws_high, settlements = await asyncio.gather(nws_task, settle_task)
+
+                # Derive actual_high from Kalshi settlement (GROUND TRUTH)
+                # Falls back to NWS observation if settlement not yet available
+                settlement_high = derive_actual_high_from_settlements(settlements)
+                actual_high = settlement_high if settlement_high is not None else nws_high
 
                 # Load ensemble snapshot if saved during yesterday's scan
                 snapshot = load_ensemble_snapshot(city_key, target_date)
@@ -202,6 +245,8 @@ async def collect_daily_data(target_date: datetime = None):
                     "date": target_date.date().isoformat(),
                     "city": city_key,
                     "actual_high": actual_high,
+                    "actual_high_source": "settlement" if settlement_high else "nws",
+                    "nws_actual_high": nws_high,
                     "settlements": settlements,
                     "collected_at": now.isoformat(),
                 }
@@ -216,7 +261,8 @@ async def collect_daily_data(target_date: datetime = None):
                 records.append(record)
 
                 settled_count = len(settlements)
-                high_str = f"{actual_high:.1f}°F" if actual_high else "N/A"
+                source = "settlement" if settlement_high else "nws"
+                high_str = f"{actual_high:.1f}°F ({source})" if actual_high else "N/A"
                 snap_str = "✓" if snapshot else "✗"
                 print(f"High: {high_str} | Settled: {settled_count} brackets | Snapshot: {snap_str}")
 
@@ -233,12 +279,103 @@ async def collect_daily_data(target_date: datetime = None):
 
     # Summary stats
     if DAILY_DATA_FILE.exists():
-        line_count = sum(1 for _ in open(DAILY_DATA_FILE))
+        with open(DAILY_DATA_FILE) as f:
+            line_count = sum(1 for _ in f)
         print(f"  Total records: {line_count} (collecting since {_first_date_in_file()})")
     else:
         print(f"  First collection — no historical data yet")
 
     print(f"  {'─'*40}")
+
+    # Enrich any records that have snapshots but missing per_model_means
+    enrich_daily_data()
+
+    # Enrich calibration records with settlement data
+    try:
+        from calibration_tracker import enrich_with_settlement
+        enriched_cal = 0
+        for r in records:
+            if r.get("actual_high") is not None:
+                result = enrich_with_settlement(
+                    r["date"], r["city"], r["actual_high"]
+                )
+                if result:
+                    enriched_cal += 1
+        if enriched_cal:
+            print(f"  Enriched {enriched_cal} calibration records with settlement data")
+    except Exception as cal_err:
+        logger.warning(f"Calibration enrichment failed: {cal_err}")
+
+    # Record successful completion for watchdog
+    from heartbeat import write_heartbeat
+    write_heartbeat("backtest_collector")
+
+
+def enrich_daily_data():
+    """Enrich existing daily_data.jsonl records with snapshot data.
+
+    Scans all records and, for any that are missing ``per_model_means``,
+    looks for a matching ensemble snapshot on disk.  Rewrites the entire
+    file in-place (atomic: write to temp, then rename).
+
+    This is the bridge between backfilled settlement-only records and the
+    calibration pipeline which needs per-model forecast data.
+    """
+    if not DAILY_DATA_FILE.exists():
+        print("  No daily_data.jsonl found — nothing to enrich")
+        return
+
+    records = []
+    enriched = 0
+    with open(DAILY_DATA_FILE) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+
+    for r in records:
+        # Skip records that already have per_model_means with data
+        existing_pmm = r.get("per_model_means")
+        if existing_pmm and len(existing_pmm) > 0:
+            continue
+
+        # Look for matching snapshot
+        date_str = r.get("date", "")
+        city = r.get("city", "")
+        if not date_str or not city:
+            continue
+
+        snap_path = SNAPSHOT_DIR / f"{date_str}_{city}.json"
+        if not snap_path.exists():
+            continue
+
+        try:
+            snap = json.loads(snap_path.read_text())
+            pmm = snap.get("per_model_means", {})
+            if pmm:
+                r["per_model_means"] = pmm
+                r["ensemble_mean"] = snap.get("mean")
+                r["ensemble_std"] = snap.get("std")
+                r["ensemble_count"] = snap.get("total_count")
+                r["nws_forecast"] = snap.get("nws_forecast_high")
+                enriched += 1
+        except (json.JSONDecodeError, Exception) as e:
+            logger.warning(f"Failed to load snapshot {snap_path}: {e}")
+
+    if enriched > 0:
+        # Atomic rewrite
+        tmp_path = DAILY_DATA_FILE.with_suffix(".jsonl.tmp")
+        with open(tmp_path, "w") as f:
+            for r in records:
+                f.write(json.dumps(r, default=str) + "\n")
+        tmp_path.rename(DAILY_DATA_FILE)
+        print(f"  Enriched {enriched} records with snapshot data")
+    else:
+        print(f"  No records to enrich (all have data or no snapshots available)")
 
 
 def _first_date_in_file() -> str:
@@ -254,10 +391,13 @@ def _first_date_in_file() -> str:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Backtest Collector — Daily settlement data for model calibration")
     parser.add_argument("--date", type=str, default=None, help="Target date (YYYY-MM-DD). Default: yesterday")
+    parser.add_argument("--enrich", action="store_true", help="Enrich existing records with snapshot data")
     args = parser.parse_args()
 
-    target = None
-    if args.date:
-        target = datetime.strptime(args.date, "%Y-%m-%d").replace(tzinfo=ET)
-
-    asyncio.run(collect_daily_data(target))
+    if args.enrich:
+        enrich_daily_data()
+    else:
+        target = None
+        if args.date:
+            target = datetime.strptime(args.date, "%Y-%m-%d").replace(tzinfo=ET)
+        asyncio.run(collect_daily_data(target))

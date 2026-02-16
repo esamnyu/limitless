@@ -30,6 +30,8 @@ class StationConfig:
     mos_mav_url: str            # GFS MOS (MAV) URL
     mos_met_url: str            # NAM MOS (MET) URL
     timezone: str               # IANA timezone
+    iem_station: str = ""         # IEM station ID (NYC, MDW — no K prefix)
+    iem_network: str = ""         # IEM network (NY_ASOS, IL_ASOS)
     dsm_times_z: List[str] = field(default_factory=list)   # DSM release times (Zulu)
     six_hour_z: List[str] = field(default_factory=lambda: ["23:51", "05:51", "11:51", "17:51"])
 
@@ -61,6 +63,7 @@ STATIONS: Dict[str, StationConfig] = {
         nws_gridpoint="OKX/33,37",
         mos_mav_url=_mos_urls("KNYC")[0],
         mos_met_url=_mos_urls("KNYC")[1],
+        iem_station="NYC", iem_network="NY_ASOS",
         timezone="America/New_York",
         dsm_times_z=["20:21", "21:21", "05:17"],
     ),
@@ -76,6 +79,7 @@ STATIONS: Dict[str, StationConfig] = {
         nws_gridpoint="LOT/75,72",
         mos_mav_url=_mos_urls("KMDW")[0],
         mos_met_url=_mos_urls("KMDW")[1],
+        iem_station="MDW", iem_network="IL_ASOS",
         timezone="America/Chicago",
         dsm_times_z=["21:00", "22:00", "06:00"],
     ),
@@ -91,6 +95,7 @@ STATIONS: Dict[str, StationConfig] = {
         nws_gridpoint="BOU/63,62",
         mos_mav_url=_mos_urls("KDEN")[0],
         mos_met_url=_mos_urls("KDEN")[1],
+        iem_station="DEN", iem_network="CO_ASOS",
         timezone="America/Denver",
         dsm_times_z=["22:00", "23:00", "07:00"],
     ),
@@ -106,6 +111,7 @@ STATIONS: Dict[str, StationConfig] = {
         nws_gridpoint="MFL/76,50",
         mos_mav_url=_mos_urls("KMIA")[0],
         mos_met_url=_mos_urls("KMIA")[1],
+        iem_station="MIA", iem_network="FL_ASOS",
         timezone="America/New_York",
         dsm_times_z=["20:30", "21:30", "05:30"],
     ),
@@ -121,6 +127,7 @@ STATIONS: Dict[str, StationConfig] = {
         nws_gridpoint="LOX/150,44",
         mos_mav_url=_mos_urls("KLAX")[0],
         mos_met_url=_mos_urls("KLAX")[1],
+        iem_station="LAX", iem_network="CA_ASOS",
         timezone="America/Los_Angeles",
         dsm_times_z=["23:00", "00:00", "08:00"],
     ),
@@ -197,13 +204,132 @@ FREEROLL_MULTIPLIER = 2.0  # Sell half when price doubles (100% ROI)
 # Above 90c, you risk 90 to make 10. Terrible risk/reward on weather.
 CAPITAL_EFFICIENCY_THRESHOLD_CENTS = 90
 
+# Mid-range profit take — sell 50% of remaining after freeroll
+# At 65¢ on a $0 cost basis, you capture 76% of max payout on that tranche
+# while letting the final 25% ride to 90¢+ or settlement.
+MID_PROFIT_THRESHOLD_CENTS = 65
+MID_PROFIT_SELL_FRACTION = 0.50  # Sell half of remaining (25% of original)
+
 # Trailing profit lock — after freeroll, protect gains
-TRAILING_OFFSET_CENTS = 8  # Sell if price drops 8¢ from peak
+# Scaled by price zone (wider when cheap, tighter as price rises)
+TRAILING_OFFSET_CENTS = 8  # Legacy default (used as fallback)
+TRAILING_ZONES = [
+    # (min_price, max_price, offset)
+    # Tightened 2026-02-15: old offsets gave back too much (37c peak → 30c exit
+    # on a 26c entry = captured only 4c of 11c gain). New offsets capture more.
+    (0,  20, 10),   # Deep value — breathing room, but not excessive
+    (20, 40,  7),   # Low-mid — where most weather trades live
+    (40, 60,  6),   # Mid — thesis developing, moderate trail
+    (60, 80,  5),   # High — protect gains actively
+    (80, 100, 3),   # Near-certain — very tight, almost at efficiency exit
+]
 
 # Near-settlement override — hold for $1 if price > threshold and near settlement
 SETTLEMENT_HOLD_THRESHOLD_CENTS = 80
 SETTLEMENT_HOUR_ET = 7  # Markets settle ~7 AM ET
 SETTLEMENT_WINDOW_HOURS = 2
+
+# Stop-loss: thesis-based (primary) + ROI backstop (secondary)
+# Primary: auto_trader re-scans and tags confidence; if conf < threshold, exit
+THESIS_BREAK_CONFIDENCE = 40  # Exit if re-scan confidence drops below this
+# Secondary: hard ROI backstop for edge cases where re-scan can't run
+STOP_LOSS_ROI_PCT = -50  # Sell everything if ROI drops to -50%
+STOP_LOSS_FLOOR_CENTS = 2  # Don't sell at 1-2¢ — too illiquid to exit
+
+# =============================================================================
+# EXIT STRATEGY UPGRADES — Institutional-grade enhancements
+# =============================================================================
+
+# ── Upgrade 1: Time-Decay Urgency Scaling ──
+# Sigmoid-based decay tightens exits as settlement approaches.
+# f(h) = 1 / (1 + exp(-steepness * (h - midpoint)))
+# Each exit threshold *= lerp(min_factor, 1.0, f(h))
+TIME_DECAY_ENABLED = True
+TIME_DECAY_MIDPOINT_HOURS = 6.0       # f(6h) = 0.5
+TIME_DECAY_STEEPNESS = 0.6            # Controls sigmoid slope
+TIME_DECAY_TRAILING_MIN_FACTOR = 0.6  # Trailing offset → 60% at settlement
+TIME_DECAY_FREEROLL_MIN_FACTOR = 0.75 # Freeroll multiplier → 75% at settlement
+TIME_DECAY_MID_PROFIT_MIN_FACTOR = 0.80  # Mid-profit → 80% at settlement
+
+# ── Upgrade 2: Observation-Aware Dynamic Trailing ──
+# After time-decay, adjust trailing offset based on live obs vs bracket.
+# Obs confirms thesis → widen (let it run). Obs diverges → tighten (protect).
+OBS_TRAILING_ENABLED = True
+OBS_TRAILING_WIDEN_FACTOR = 1.3       # +30% when obs confirms bracket
+OBS_TRAILING_TIGHTEN_FACTOR = 0.6     # -40% when obs diverges
+OBS_TRAILING_DIVERGENCE_F = 3.0       # °F outside bracket to trigger tightening
+
+# ── Upgrade 3: Adaptive Freeroll Trigger ──
+# Price-level-aware freeroll multiplier. Cheap entries get more room;
+# expensive entries lock profit earlier.
+ADAPTIVE_FREEROLL_ENABLED = True
+ADAPTIVE_FREEROLL_TIERS = [
+    # (min_entry, max_entry, multiplier)
+    # Calibrated 2026-02-15: old 1.8x at 26c entry → 47c target was unreachable
+    # (market peaked at 37c). New tiers produce reachable targets.
+    (0,  10, 2.5),   # Very cheap (≤9c) → let it run, doubles easily
+    (10, 20, 2.0),   # Cheap (10-19c) → standard double
+    (20, 30, 1.5),   # Mid-price (20-29c) → 26c×1.5=39c (reachable near peak)
+    (30, 40, 1.4),   # Upper-mid (30-39c) → lock in at +40%
+    (40, 51, 1.3),   # Expensive (40-50c) → lock in fast at +30%
+]
+
+# ── Upgrade 3b: Quick-Profit Take (pre-freeroll partial exit) ──
+# When price rises significantly but hasn't reached freeroll target,
+# sell a portion to bank some gains before a reversal.
+# Added 2026-02-15 after LAX trade peaked at 37c (entry 26c, +42% ROI)
+# but no mechanism existed to take profit below the 47c freeroll target.
+QUICK_PROFIT_ENABLED = True
+QUICK_PROFIT_ROI_PCT = 35           # Trigger at +35% ROI (26c → 35c)
+QUICK_PROFIT_SELL_FRACTION = 0.30   # Sell 30% of position
+QUICK_PROFIT_MIN_CONTRACTS = 3      # Need at least 3 contracts to trigger
+
+# ── Upgrade 4: Momentum / Velocity Exit ──
+# Track price changes between monitor cycles (~5 min).
+# Large drops pre-freeroll trigger alert + temporary floor.
+MOMENTUM_EXIT_ENABLED = True
+MOMENTUM_DROP_ALERT_CENTS = 15   # Alert if price drops >15¢ in one cycle
+MOMENTUM_DROP_TIGHTEN_CENTS = 10 # Set floor at (current_price + 10¢)
+
+# ── Upgrade 5: Graduated Thesis Deterioration ──
+# Three zones instead of binary hold/dump:
+#   conf >= 70: hold | 40 <= conf < 70: trim 50% | conf < 40: full exit
+THESIS_TRIM_ENABLED = True
+THESIS_TRIM_CONFIDENCE_HIGH = 70   # Below this → trim (not full exit)
+THESIS_TRIM_SELL_FRACTION = 0.50   # Sell 50% on trim
+
+# ── Upgrade 6: Pending Sell Repricing ──
+# Smart repricing of stale limit sells before the 30-min expiry catches them.
+SELL_REPRICE_ENABLED = True
+SELL_REPRICE_MIN_CYCLES = 3        # Wait 3 cycles (~15 min) before repricing
+SELL_REPRICE_BID_DRIFT_CENTS = 3   # Reprice if bid drifted >3¢ from sell price
+SELL_REPRICE_MAX_PER_ORDER = 2     # Max reprices before 30-min expiry handles it
+
+# =============================================================================
+# HYBRID TRADE SCORE (replaces simple confidence >= 90 gate)
+# =============================================================================
+
+# Feature flag: when False, falls back to old MIN_CONFIDENCE_TO_TRADE gate
+TRADE_SCORE_ENABLED = True
+
+# Threshold for trade_score to fire (0.0 to 1.0)
+# Initial 0.55 from numerical walkthrough; calibrate after 30-60 days of data
+TRADE_SCORE_THRESHOLD = 0.55
+
+# Hard floors (never relaxed, even if trade_score is high)
+TRADE_SCORE_CONFIDENCE_FLOOR = 70   # Absolute minimum confidence (0-100)
+TRADE_SCORE_MIN_EDGE_CENTS = 10     # Minimum edge after fees (cents)
+
+# Entry price penalty — expensive entries have worse asymmetry
+# At 5c entry: max payout 19:1. At 26c: max payout 3.8:1.
+# Penalize entries >20c to prefer cheap, high-asymmetry trades.
+TRADE_SCORE_ENTRY_PRICE_PENALTY_START = 20   # No penalty below this
+TRADE_SCORE_ENTRY_PRICE_PENALTY_RATE = 0.004 # Per cent above start (e.g. 26c → 6*0.004 = -0.024)
+
+# Liquidity thresholds
+TRADE_SCORE_LOW_VOLUME = 500        # Below this: heavy penalty (-0.15)
+TRADE_SCORE_MED_VOLUME = 1000       # Below this: light penalty (-0.08)
+TRADE_SCORE_WIDE_SPREAD = 5         # Above this spread: penalty (-0.05)
 
 # =============================================================================
 # SMART PEGGING (Order Execution)
@@ -249,6 +375,14 @@ WET_BULB_HEAVY_PRECIP_THRESHOLD = 70    # Precip % threshold for heavy factor
 
 # Strategy E: MOS Consensus (Model vs Official)
 MOS_DIVERGENCE_THRESHOLD_F = 2.0  # If NWS > MOS consensus by this much, fade NWS
+
+# Strategy F: Post-Peak Lock-In (peak_monitor.py)
+PEAK_MIN_DECLINE_OBS = 3         # Consecutive declining obs to confirm peak
+PEAK_MIN_DROP_F = 1.5            # Min °F below running max to confirm
+PEAK_MIN_DECLINE_MINUTES = 45    # Min minutes since max was set
+PEAK_EARLIEST_HOUR = 12          # Don't confirm before noon local
+PEAK_LATEST_HOUR = 22            # Stop monitoring after 10 PM local
+PEAK_POLL_INTERVAL_SEC = 300     # Seconds between polls in --watch mode
 
 # Confidence levels for strategies
 CONFIDENCE_MIDNIGHT_HIGH = 0.80  # 80% confidence for midnight high
@@ -352,3 +486,92 @@ LLM_MODELS = [
     "openai/gpt-4o",
     "deepseek/deepseek-chat",
 ]
+
+
+# =============================================================================
+# CPI TRADING PARAMETERS (mirrors cpi_config.py — cross-reference)
+# =============================================================================
+# These are duplicated here so modules importing from config.py can access
+# CPI params without importing cpi_config. Canonical values in cpi_config.py.
+
+# =============================================================================
+# POSITION MONITOR PARAMETERS
+# =============================================================================
+
+# How long to wait for a limit sell order to fill before cancelling and re-evaluating
+PENDING_SELL_EXPIRY_MINUTES = 30
+
+# Minutes before a DSM/6-hour observation release to pull resting buy orders
+# The DSM Bot and 6-Hour Bot will reprice the market instantly after release
+BOT_WINDOW_BUFFER_MIN = 15
+
+# =============================================================================
+# AUTO TRADER SAFETY PARAMETERS
+# =============================================================================
+
+# Maximum trades per day (hard cap for auto-trader)
+AUTO_MAX_TRADES_PER_DAY = 8
+
+# Circuit breaker: halt after N consecutive losses in one day
+AUTO_CIRCUIT_BREAKER_LOSSES = 4
+
+# Daily loss limit as % of NLV (halt trading if exceeded)
+AUTO_DAILY_LOSS_LIMIT_PCT = 0.15
+
+# Re-entry after trailing stop exit
+# If scanner still shows high confidence and the market dipped (trailing stop
+# triggered by thin-book volatility, not thesis break), re-enter.
+REENTRY_MIN_CONFIDENCE = 90       # Must still be 90+ to re-enter
+REENTRY_COOLDOWN_MINUTES = 30     # Wait at least 30min after trailing stop exit
+REENTRY_MAX_PER_TICKER_PER_DAY = 1  # Max 1 re-entry per ticker per day
+
+
+# =============================================================================
+# STRATEGY G: PEAK → TRADE PIPELINE (same-day settlement plays)
+# =============================================================================
+
+# Feature flag: when False, peak_monitor only alerts (no auto-execution)
+PEAK_TRADE_ENABLED = True
+
+# Minimum edge (in cents) to trigger a peak trade
+# Peak trades have ~95% true probability, so edge = 95 - market_bid
+PEAK_TRADE_MIN_EDGE_CENTS = 10
+
+# Maximum price to pay for a settlement bracket (don't buy at 90¢+ — thin edge)
+PEAK_TRADE_MAX_PRICE_CENTS = 85
+
+# Minimum hours to settlement — don't trade if market closes in < N hours
+# (too little time for limit order to fill)
+PEAK_TRADE_MIN_HOURS_TO_SETTLE = 1.0
+
+# True probability assigned to a confirmed peak (conservative estimate)
+# In practice, post-peak lock-in is >98%, but we use 95 for safety
+PEAK_TRADE_TRUE_PROB_CENTS = 95
+
+# Maximum contracts per peak trade (separate from scanner trades)
+PEAK_TRADE_MAX_CONTRACTS = 20
+
+# =============================================================================
+# STALE PRICE DETECTOR (scan delta tracking)
+# =============================================================================
+
+# Feature flag
+STALE_PRICE_ENABLED = True
+
+# Minimum shift in ensemble mean between scans to flag (°F)
+STALE_PRICE_MIN_SHIFT_F = 1.5
+
+# Minimum price gap: if market hasn't repriced by this many cents, alert
+STALE_PRICE_MIN_GAP_CENTS = 8
+
+# State file for previous scan data
+STALE_PRICE_STATE_FILE = "stale_price_state.json"
+
+
+CPI_MAX_POSITION_PCT = 0.15         # 15% per trade (vs 10% for weather)
+CPI_MAX_DAILY_EXPOSURE = 0.30       # 30% across all CPI positions
+CPI_MAX_CORRELATED_EXPOSURE = 0.20  # 20% across correlated CPI markets
+CPI_MIN_EDGE_THRESHOLD = 0.12       # 12% minimum edge (vs 15% for weather)
+CPI_MIN_KDE_PROBABILITY = 0.15      # 15% minimum model probability (vs 20%)
+CPI_MIN_CONFIDENCE_TO_TRADE = 85    # 85/100 (vs 90 for weather)
+CPI_MAX_ENTRY_PRICE_CENTS = 65      # 65 cents (vs 50 for weather)

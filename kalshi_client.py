@@ -4,6 +4,7 @@
 import asyncio
 import base64
 import logging
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -58,6 +59,22 @@ class KalshiRateLimitError(KalshiAPIError):
 class KalshiClient:
     """Async client for Kalshi trading API with retry logic."""
 
+    # Monotonic timestamp counter to prevent duplicate signatures.
+    # Two requests within the same millisecond would produce identical
+    # signatures without this — the counter ensures strict ordering.
+    _ts_lock = threading.Lock()
+    _last_ts = 0
+
+    @classmethod
+    def _monotonic_ts_ms(cls) -> int:
+        """Return a strictly increasing millisecond timestamp."""
+        with cls._ts_lock:
+            ts = int(time.time() * 1000)
+            if ts <= cls._last_ts:
+                ts = cls._last_ts + 1
+            cls._last_ts = ts
+            return ts
+
     def __init__(self, api_key_id: str = "", private_key_path: str = "", demo_mode: bool = True):
         self.api_key_id = api_key_id
         self.private_key_path = private_key_path
@@ -98,7 +115,7 @@ class KalshiClient:
 
     def _sign(self, method: str, path: str) -> dict:
         """Generate RSA-PSS signature for authenticated requests."""
-        ts = str(int(time.time() * 1000))
+        ts = str(self._monotonic_ts_ms())
         msg = f"{ts}{method}/trade-api/v2{path.split('?')[0]}"
         sig = base64.b64encode(
             self.private_key.sign(

@@ -69,6 +69,35 @@ class TestErrors:
 
 
 # =============================================================================
+# MONOTONIC TIMESTAMP TESTS
+# =============================================================================
+
+class TestMonotonicTimestamp:
+    """Tests for the monotonic timestamp counter that prevents duplicate signatures."""
+
+    def test_monotonic_always_increases(self):
+        """Consecutive calls must return strictly increasing values."""
+        ts1 = KalshiClient._monotonic_ts_ms()
+        ts2 = KalshiClient._monotonic_ts_ms()
+        ts3 = KalshiClient._monotonic_ts_ms()
+        assert ts2 > ts1
+        assert ts3 > ts2
+
+    def test_monotonic_no_duplicates_rapid_fire(self):
+        """100 rapid-fire calls must all be unique."""
+        timestamps = [KalshiClient._monotonic_ts_ms() for _ in range(100)]
+        assert len(set(timestamps)) == 100
+
+    def test_monotonic_is_reasonable_ms(self):
+        """Timestamp should be in plausible millisecond range."""
+        import time
+        ts = KalshiClient._monotonic_ts_ms()
+        now_ms = int(time.time() * 1000)
+        # Should be within 1 second of real time
+        assert abs(ts - now_ms) < 1000
+
+
+# =============================================================================
 # RUN TESTS
 # =============================================================================
 

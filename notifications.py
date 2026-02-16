@@ -29,9 +29,18 @@ logger = get_logger(__name__)
 __all__ = ["send_discord_alert", "send_discord_embeds"]
 
 ET = ZoneInfo("America/New_York")
-DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL") or os.getenv("DISCORD_WEBHOOK")
 PROJECT_ROOT = Path(__file__).resolve().parent
 FALLBACK_FILE = PROJECT_ROOT / "alerts_fallback.jsonl"
+
+
+def _get_discord_webhook() -> str:
+    """Lazy lookup of Discord webhook URL.
+
+    Reading at call time (not import time) ensures dotenv has been loaded
+    by the calling module, fixing watchdog.py which imports notifications
+    before loading .env.
+    """
+    return os.getenv("DISCORD_WEBHOOK_URL") or os.getenv("DISCORD_WEBHOOK") or ""
 
 # Retry config
 MAX_RETRIES = 3
@@ -108,6 +117,9 @@ def _chunk_embeds(embeds: list[dict]) -> list[list[dict]]:
     return chunks
 
 
+UTC = ZoneInfo("UTC")
+
+
 async def send_discord_alert(
     title: str,
     description: str,
@@ -123,7 +135,9 @@ async def send_discord_alert(
         "title": title,
         "description": description,
         "color": color,
-        "timestamp": datetime.now(ET).isoformat(),
+        # Discord expects UTC ISO 8601 timestamps for embed timestamps.
+        # Using ET here caused Discord to display incorrect times.
+        "timestamp": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
     }
     await send_discord_embeds([embed], context=context)
 
@@ -139,7 +153,9 @@ async def send_discord_embeds(
     Used by auto_scan.py for multi-embed scan results.
     Falls back to JSONL file if Discord is persistently unreachable.
     """
-    if not DISCORD_WEBHOOK:
+    webhook_url = _get_discord_webhook()
+
+    if not webhook_url:
         logger.warning("No DISCORD_WEBHOOK set — skipping notification")
         _save_to_fallback(embeds, context=context or "no_webhook")
         return
@@ -163,7 +179,7 @@ async def send_discord_embeds(
     async with aiohttp.ClientSession() as session:
         for chunk in chunks:
             payload = {"embeds": chunk}
-            success = await _post_with_retry(session, DISCORD_WEBHOOK, payload)
+            success = await _post_with_retry(session, webhook_url, payload)
 
             if success:
                 logger.debug(f"Discord alert sent ({len(chunk)} embeds)")

@@ -20,6 +20,7 @@ from edge_scanner_v2 import (
     kde_probability,
     silverman_bandwidth,
     weight_ensemble_members,
+    build_member_weights,
     parse_bracket_range,
     kelly_fraction,
     taker_fee_cents,
@@ -94,6 +95,22 @@ class TestKDEProbability:
         # Wider bandwidth → more smoothing → lower peak probability in center bracket
         assert prob_narrow > prob_wide
 
+    def test_weighted_kde(self):
+        """Higher-weighted members should shift probability toward their values."""
+        # Two clusters: 40°F (high weight) and 50°F (low weight)
+        members = [40.0] * 10 + [50.0] * 10
+        # Equal weights → roughly equal probability in each bracket
+        prob_40_equal = kde_probability(members, 39, 41, bandwidth=1.0)
+        prob_50_equal = kde_probability(members, 49, 51, bandwidth=1.0)
+
+        # Heavy weight on 40°F cluster → more probability there
+        weights = [3.0] * 10 + [0.5] * 10
+        prob_40_weighted = kde_probability(members, 39, 41, bandwidth=1.0, weights=weights)
+        prob_50_weighted = kde_probability(members, 49, 51, bandwidth=1.0, weights=weights)
+
+        assert prob_40_weighted > prob_40_equal
+        assert prob_50_weighted < prob_50_equal
+
 
 # ═══════════════════════════════════════════════════════════
 #  SILVERMAN BANDWIDTH
@@ -101,11 +118,12 @@ class TestKDEProbability:
 
 class TestSilvermanBandwidth:
     def test_known_std(self):
-        """Members with known std → predictable bandwidth."""
+        """Members with known std → predictable bandwidth (uses sample std, ddof=1)."""
         members = list(np.random.normal(40, 2, 100))
         bw = silverman_bandwidth(members)
-        # Silverman: 1.06 * std * n^(-0.2)
-        expected = 1.06 * np.std(members) * 100 ** (-0.2)
+        # Silverman: 1.06 * std(ddof=1) * n^(-0.2) * bandwidth_factor
+        from edge_scanner_v2 import _BANDWIDTH_FACTOR
+        expected = 1.06 * np.std(members, ddof=1) * 100 ** (-0.2) * _BANDWIDTH_FACTOR
         assert abs(bw - expected) < 0.1
 
     def test_single_member(self):
@@ -128,23 +146,25 @@ class TestSilvermanBandwidth:
 # ═══════════════════════════════════════════════════════════
 
 class TestWeightEnsembleMembers:
+    """weight_ensemble_members returns all raw members sorted (no resampling)."""
+
     def test_single_model_weight_1(self):
-        """Weight 1.0 → same number of members."""
+        """Weight 1.0 → same number of members (all raw)."""
         mg = ModelGroup(name="GFS", members=[30, 31, 32, 33, 34], weight=1.0)
         result = weight_ensemble_members([mg])
         assert len(result) == 5
 
-    def test_oversample(self):
-        """Weight 1.3 with 10 members → 13 weighted members."""
+    def test_high_weight_returns_all(self):
+        """Weight 1.3 with 10 members → still 10 (no resampling)."""
         mg = ModelGroup(name="AIFS", members=list(range(10)), weight=1.3)
         result = weight_ensemble_members([mg])
-        assert len(result) == 13
+        assert len(result) == 10  # All raw members, not oversampled
 
-    def test_subsample(self):
-        """Weight 0.5 with 10 members → 5 weighted members."""
+    def test_low_weight_returns_all(self):
+        """Weight 0.5 with 10 members → still 10 (weighting is in KDE, not here)."""
         mg = ModelGroup(name="GEM", members=list(range(10)), weight=0.5)
         result = weight_ensemble_members([mg])
-        assert len(result) == 5
+        assert len(result) == 10
 
     def test_empty_model(self):
         """Empty members → nothing contributed."""
@@ -153,21 +173,56 @@ class TestWeightEnsembleMembers:
         assert len(result) == 0
 
     def test_multi_model(self):
-        """Multiple models with different weights."""
+        """Multiple models → all raw members combined and sorted."""
         models = [
-            ModelGroup(name="AIFS", members=[40.0] * 10, weight=1.3),  # → 13
-            ModelGroup(name="GFS", members=[41.0] * 10, weight=1.0),   # → 10
-            ModelGroup(name="GEM", members=[42.0] * 10, weight=0.8),   # → 8
+            ModelGroup(name="AIFS", members=[40.0] * 10, weight=1.3),
+            ModelGroup(name="GFS", members=[41.0] * 10, weight=1.0),
+            ModelGroup(name="GEM", members=[42.0] * 10, weight=0.8),
         ]
         result = weight_ensemble_members(models)
-        assert len(result) == 31  # 13 + 10 + 8
+        assert len(result) == 30  # 10 + 10 + 10 (all raw)
         assert result == sorted(result)  # Should be sorted
 
-    def test_zero_weight(self):
-        """Weight 0.0 → no members contributed."""
-        mg = ModelGroup(name="BAD", members=[40.0] * 10, weight=0.0)
-        result = weight_ensemble_members([mg])
-        assert len(result) == 0
+
+class TestBuildMemberWeights:
+    """build_member_weights returns parallel (members, weights) for weighted KDE."""
+
+    def test_single_model(self):
+        """Single model → weights all equal to model weight."""
+        mg = ModelGroup(name="GFS", members=[30, 31, 32], weight=1.0)
+        members, weights = build_member_weights([mg])
+        assert len(members) == 3
+        assert len(weights) == 3
+        assert all(w == 1.0 for w in weights)
+
+    def test_weights_match_model(self):
+        """Each member's weight equals its model's weight."""
+        models = [
+            ModelGroup(name="AIFS", members=[40.0, 40.5], weight=1.3),
+            ModelGroup(name="GFS", members=[41.0], weight=1.0),
+        ]
+        members, weights = build_member_weights(models)
+        assert len(members) == 3
+        # Sorted by value: 40.0, 40.5, 41.0
+        assert weights[0] == 1.3  # AIFS member (40.0)
+        assert weights[1] == 1.3  # AIFS member (40.5)
+        assert weights[2] == 1.0  # GFS member (41.0)
+
+    def test_empty_models(self):
+        """Empty models → empty output."""
+        mg = ModelGroup(name="EMPTY", members=[], weight=1.0)
+        members, weights = build_member_weights([mg])
+        assert members == []
+        assert weights == []
+
+    def test_sorted_output(self):
+        """Output members are sorted by value."""
+        models = [
+            ModelGroup(name="GFS", members=[42.0, 38.0], weight=1.0),
+            ModelGroup(name="AIFS", members=[40.0], weight=1.3),
+        ]
+        members, _ = build_member_weights(models)
+        assert members == sorted(members)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -294,30 +349,38 @@ class TestTakerFee:
 
 class TestComputeConfidenceScore:
     def _make_ensemble(self, mean=40.0, std=0.8, n_members=194):
-        """Helper: create a realistic ensemble."""
+        """Helper: create a realistic ensemble with weighted members."""
         members = list(np.random.normal(mean, std, n_members))
         models = [
-            ModelGroup(name="AIFS", members=members[:51], weight=1.3,
-                      mean=np.mean(members[:51]), std=np.std(members[:51])),
-            ModelGroup(name="IFS", members=members[51:102], weight=1.15,
-                      mean=np.mean(members[51:102]), std=np.std(members[51:102])),
-            ModelGroup(name="GFS", members=members[102:133], weight=1.0,
-                      mean=np.mean(members[102:133]), std=np.std(members[102:133])),
-            ModelGroup(name="ICON", members=members[133:173], weight=0.95,
-                      mean=np.mean(members[133:173]), std=np.std(members[133:173])),
-            ModelGroup(name="GEM", members=members[173:], weight=0.85,
-                      mean=np.mean(members[173:]), std=np.std(members[173:])),
+            ModelGroup(name="ecmwf_aifs025", members=members[:51], weight=1.3,
+                      mean=float(np.mean(members[:51])), std=float(np.std(members[:51], ddof=1)) if len(members[:51]) > 1 else 0),
+            ModelGroup(name="ecmwf_ifs025", members=members[51:102], weight=1.15,
+                      mean=float(np.mean(members[51:102])), std=float(np.std(members[51:102], ddof=1))),
+            ModelGroup(name="gfs_seamless", members=members[102:133], weight=1.0,
+                      mean=float(np.mean(members[102:133])), std=float(np.std(members[102:133], ddof=1))),
+            ModelGroup(name="icon_seamless", members=members[133:173], weight=0.95,
+                      mean=float(np.mean(members[133:173])), std=float(np.std(members[133:173], ddof=1))),
+            ModelGroup(name="gem_global", members=members[173:], weight=0.85,
+                      mean=float(np.mean(members[173:])), std=float(np.std(members[173:], ddof=1))),
         ]
-        wm = weight_ensemble_members(models)
+        wm, mw = build_member_weights(models)
         wm_arr = np.asarray(wm)
+        w_arr = np.asarray(mw)
+        w_norm = w_arr / w_arr.sum()
+        weighted_mean = float(np.average(wm_arr, weights=w_norm))
+        v1 = w_norm.sum()
+        v2 = (w_norm ** 2).sum()
+        denom = v1 * v1 - v2
+        weighted_std = float(np.sqrt((w_norm * (wm_arr - weighted_mean) ** 2).sum() / denom)) if denom > 0 else float(np.std(wm_arr, ddof=1))
         return EnsembleV2(
             models=models,
             all_members=members,
             weighted_members=wm,
+            member_weights=mw,
             total_count=n_members,
-            mean=float(np.mean(wm_arr)),
+            mean=weighted_mean,
             median=float(np.median(wm_arr)),
-            std=float(np.std(wm_arr)),
+            std=weighted_std,
             min_val=float(np.min(wm_arr)),
             max_val=float(np.max(wm_arr)),
             p10=float(np.percentile(wm_arr, 10)),
@@ -455,6 +518,7 @@ class TestPositionStore:
         position_store.LOCK_FILE = tmp_path / ".positions.lock"
 
         try:
+            # RESTING orders get status "resting" (not "open")
             position_store.register_position(
                 ticker="KXHIGHNY-TEST",
                 side="yes",
@@ -468,8 +532,22 @@ class TestPositionStore:
             assert loaded[0]["ticker"] == "KXHIGHNY-TEST"
             assert loaded[0]["contracts"] == 5
             assert loaded[0]["avg_price"] == 20
+            assert loaded[0]["status"] == "resting"
+
+            # EXECUTED orders get status "open"
+            position_store.POSITIONS_FILE.unlink()
+            position_store.register_position(
+                ticker="KXHIGHNY-TEST2",
+                side="yes",
+                price=15,
+                quantity=10,
+                order_id="order-456",
+                status="EXECUTED",
+            )
+            loaded = position_store.load_positions()
+            assert len(loaded) == 1
             assert loaded[0]["status"] == "open"
-            assert loaded[0]["exit_rules"]["freeroll_at"] == 40
+            assert loaded[0]["exit_rules"]["freeroll_at"] == 30
         finally:
             position_store.POSITIONS_FILE = orig_pos
             position_store.LOCK_FILE = orig_lock
@@ -526,6 +604,32 @@ class TestPositionStore:
         finally:
             position_store.POSITIONS_FILE = orig_pos
             position_store.LOCK_FILE = orig_lock
+
+    def test_position_dict_type_exists(self):
+        """PositionDict TypedDict should be importable and have expected keys."""
+        from position_store import PositionDict
+        # TypedDict annotations should include our core fields
+        annotations = PositionDict.__annotations__
+        assert "ticker" in annotations
+        assert "side" in annotations
+        assert "avg_price" in annotations
+        assert "contracts" in annotations
+        assert "status" in annotations
+        assert "last_confidence" in annotations
+        assert "bracket_low" in annotations
+        assert "current_obs_temp" in annotations
+        assert "sell_placed_at" in annotations
+
+    def test_lock_timeout_error_importable(self):
+        """LockTimeoutError should be importable."""
+        from position_store import LockTimeoutError
+        err = LockTimeoutError("test timeout")
+        assert "test timeout" in str(err)
+
+    def test_lock_timeout_constant(self):
+        """Lock timeout should be a reasonable value (not 0 or huge)."""
+        from position_store import LOCK_TIMEOUT_SEC
+        assert 1 <= LOCK_TIMEOUT_SEC <= 60
 
 
 # ═══════════════════════════════════════════════════════════

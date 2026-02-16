@@ -69,16 +69,34 @@ MODEL_KEY_SUFFIXES = {
     "gem_global": "gem_global_ensemble",
 }
 
-# Model weights — based on general verification performance
-# AIFS > IFS > GFS > ICON > GEM for temperature
-# These should be calibrated with backtest data
-MODEL_WEIGHTS = {
+# Model weights — defaults based on general verification performance
+# Overridden by calibration.py when backtest data is available
+_DEFAULT_MODEL_WEIGHTS = {
     "ecmwf_aifs025": 1.30,   # AI model — 10% better than IFS per ECMWF
     "ecmwf_ifs025": 1.15,    # Gold standard physics model
     "gfs_seamless": 1.00,    # Baseline
     "icon_seamless": 0.95,   # Slightly less skillful at US sites
     "gem_global": 0.85,      # Lower resolution, less verification data
 }
+
+# Load calibrated params if available (falls back to defaults gracefully)
+_CALIBRATED_WEIGHTS = {}
+_BANDWIDTH_FACTOR = 1.0
+try:
+    from calibration import get_calibrated_params
+    _cal_w, _cal_bw = get_calibrated_params()
+    if _cal_w:
+        _CALIBRATED_WEIGHTS = _cal_w
+        logger.info("Using calibrated model weights from backtest data")
+    if _cal_bw and _cal_bw > 0:
+        _BANDWIDTH_FACTOR = _cal_bw
+        logger.info("Using calibrated bandwidth factor: %.3f", _cal_bw)
+except ImportError:
+    pass  # calibration.py not available
+except Exception as e:
+    logger.debug("Calibration load failed (using defaults): %s", e)
+
+MODEL_WEIGHTS = _CALIBRATED_WEIGHTS if _CALIBRATED_WEIGHTS else _DEFAULT_MODEL_WEIGHTS
 
 # Derive CITIES dict from canonical config.py STATIONS (single source of truth)
 from config import STATIONS as _STATIONS
@@ -117,6 +135,7 @@ class EnsembleV2:
     models: list[ModelGroup] = field(default_factory=list)
     all_members: list[float] = field(default_factory=list)
     weighted_members: list[float] = field(default_factory=list)
+    member_weights: list[float] = field(default_factory=list)  # Per-member KDE weights (parallel to weighted_members)
     total_count: int = 0
     # Stats from weighted distribution
     mean: float = 0.0
@@ -131,6 +150,7 @@ class EnsembleV2:
     p90: float = 0.0
     # KDE
     kde_bandwidth: float = 0.0
+    is_bimodal: bool = False  # True when ensemble splits into 2 clusters
 
 
 @dataclass
@@ -179,16 +199,24 @@ class Opportunity:
     # Timing
     entry_window: str = ""
     bot_risk: str = ""
+    # Hybrid Trade Score
+    trade_score: float = 0.0
+    trade_score_components: dict = field(default_factory=dict)
 
 
 # ─── KDE Engine (vectorized with numpy) ───────────────
 
-def kde_probability(members: list[float], low: float, high: float, bandwidth: float = None, n_points: int = 200) -> float:
+def kde_probability(members: list[float], low: float, high: float, bandwidth: float = None,
+                    n_points: int = 200, weights: list[float] = None,
+                    min_bandwidth: float = 0.3) -> float:
     """
     Compute bracket probability using Gaussian KDE (numpy-vectorized).
 
     Smooths the discrete ensemble members into a continuous PDF,
     then integrates over the bracket range using the trapezoidal rule.
+
+    If `weights` is provided, each kernel is weighted proportionally
+    (e.g., AIFS members get 1.30x weight). This avoids resampling artifacts.
 
     ~50x faster than the pure-Python version for 200+ members.
     """
@@ -199,12 +227,13 @@ def kde_probability(members: list[float], low: float, high: float, bandwidth: fl
 
     # Silverman's rule of thumb for bandwidth selection
     if bandwidth is None:
-        std = np.std(m)
+        std = np.std(m, ddof=1)
         if std == 0:
             return 1.0 if low <= m[0] < high else 0.0
         bandwidth = 1.06 * std * len(m) ** (-0.2)
     # Floor: prevent under-smoothing with very tight ensembles
-    bandwidth = max(0.3, bandwidth)
+    # Default 0.3°F for weather; CPI passes min_bandwidth=0.005 for % scale
+    bandwidth = max(min_bandwidth, bandwidth)
 
     # Clamp integration range
     range_low = max(low, m.min() - 4 * bandwidth)
@@ -221,59 +250,134 @@ def kde_probability(members: list[float], low: float, high: float, bandwidth: fl
     x_grid = np.linspace(range_low, range_high, n_points + 1)
     z = (x_grid[:, np.newaxis] - m[np.newaxis, :]) / bandwidth
     kernel_vals = np.exp(-0.5 * z * z) / (bandwidth * np.sqrt(2 * np.pi))
-    density = kernel_vals.mean(axis=1)  # Average over members
+
+    if weights is not None and len(weights) == len(members):
+        # Weighted KDE: each kernel contributes proportionally to its model weight
+        w = np.asarray(weights, dtype=np.float64)
+        w_total = w.sum()
+        if w_total > 0:
+            w = w / w_total  # Normalize to sum to 1
+        else:
+            w = np.ones_like(w) / len(w)  # Fallback: equal weights if all zero
+        density = (kernel_vals * w[np.newaxis, :]).sum(axis=1)
+    else:
+        density = kernel_vals.mean(axis=1)  # Unweighted: equal contribution
 
     # Trapezoidal integration
-    prob = float(np.trapz(density, x_grid))
+    # np.trapezoid (numpy ≥2.0) replaces deprecated np.trapz
+    _trapz = getattr(np, "trapezoid", None) or np.trapz
+    prob = float(_trapz(density, x_grid))
     return min(1.0, max(0.0, prob))
 
 
-def silverman_bandwidth(members: list[float]) -> float:
-    """Silverman's rule of thumb bandwidth."""
+def _detect_bimodal(members_sorted: np.ndarray, gap_threshold: float = 3.0) -> bool:
+    """Detect bimodality in ensemble distribution.
+
+    Uses a gap-based heuristic: if the largest gap between adjacent sorted
+    members (in the middle 60% of the distribution) exceeds `gap_threshold`
+    degrees AND is at least 1.5× the median gap, the distribution is bimodal.
+
+    This catches the common case where AIFS clusters around 35°F and IFS
+    clusters around 31°F — the gap between clusters will be much larger
+    than the within-cluster spacing.
+
+    Args:
+        members_sorted: Pre-sorted numpy array of ensemble values.
+        gap_threshold: Minimum gap size (°F) to consider bimodal.
+
+    Returns:
+        True if distribution appears bimodal.
+    """
+    n = len(members_sorted)
+    if n < 20:
+        return False
+
+    # Focus on middle 60% to avoid tail outliers
+    lo_idx = int(n * 0.2)
+    hi_idx = int(n * 0.8)
+    middle = members_sorted[lo_idx:hi_idx]
+
+    if len(middle) < 5:
+        return False
+
+    gaps = np.diff(middle)
+    max_gap = float(gaps.max())
+    median_gap = float(np.median(gaps))
+
+    # Bimodal if: largest gap is big enough AND clearly anomalous
+    return max_gap >= gap_threshold and (median_gap == 0 or max_gap >= 1.5 * median_gap)
+
+
+def silverman_bandwidth(members: list[float], min_bandwidth: float = 0.3) -> float:
+    """Adaptive bandwidth: Silverman's rule with bimodal correction.
+
+    Uses Silverman's rule of thumb as baseline, then checks for bimodality.
+    When the ensemble splits into two clusters (e.g., AIFS vs IFS disagree
+    by 3+°F), Silverman over-smooths because it assumes unimodal Gaussian.
+    In that case, we reduce bandwidth by 40% to preserve the two peaks.
+
+    Args:
+        members: Ensemble member values.
+        min_bandwidth: Floor to prevent under-smoothing. Default 0.3°F for weather;
+                       CPI should pass 0.005 for percentage-scale data.
+    """
     if len(members) < 2:
         return 1.0
     m = np.asarray(members, dtype=np.float64)
-    std = float(np.std(m))
-    return max(0.3, 1.06 * std * len(m) ** (-0.2))
+    m_sorted = np.sort(m)
+    std = float(np.std(m, ddof=1))
+    bw = 1.06 * std * len(m) ** (-0.2)
+
+    # Bimodal correction: reduce bandwidth to prevent over-smoothing
+    if _detect_bimodal(m_sorted):
+        bw *= 0.6  # 40% narrower — preserves two distinct peaks
+
+    # Apply calibration factor from backtest data (1.0 = no correction)
+    bw *= _BANDWIDTH_FACTOR
+    return max(min_bandwidth, bw)
 
 
 # ─── Model Weighting ──────────────────────────────────
 
 def weight_ensemble_members(models: list[ModelGroup]) -> list[float]:
     """
-    Create a weighted member list by resampling.
+    Create a weighted member list (backward-compatible return for stats).
 
-    If AIFS has weight 1.3 and 51 members, and GFS has weight 1.0 and 31 members:
-    AIFS contributes 51 * 1.3 = 66.3 effective members
-    GFS contributes 31 * 1.0 = 31 effective members
-
-    We achieve this by repeating/sampling members proportionally.
+    Returns all raw members sorted. Use build_member_weights() for
+    per-member KDE weights that avoid resampling artifacts.
     """
-    weighted = []
+    all_members = []
     for mg in models:
         if not mg.members:
             continue
-        # Number of effective copies (fractional → stochastic rounding)
-        effective_n = int(round(len(mg.members) * mg.weight))
-        if effective_n <= 0:
+        all_members.extend(mg.members)
+    return sorted(all_members)
+
+
+def build_member_weights(models: list[ModelGroup]) -> tuple[list[float], list[float]]:
+    """
+    Build parallel (members, weights) arrays for weighted KDE.
+
+    Each member gets a weight equal to its model weight. The KDE then
+    weights each kernel proportionally, avoiding duplication artifacts
+    from the old resampling approach.
+
+    Returns (sorted_members, corresponding_weights).
+    """
+    pairs = []
+    for mg in models:
+        if not mg.members:
             continue
+        for val in mg.members:
+            pairs.append((val, mg.weight))
 
-        if effective_n <= len(mg.members):
-            # Subsample
-            step = len(mg.members) / effective_n
-            for i in range(effective_n):
-                idx = min(int(i * step), len(mg.members) - 1)
-                weighted.append(mg.members[idx])
-        else:
-            # Oversample (repeat all + random extras)
-            weighted.extend(mg.members)
-            extras = effective_n - len(mg.members)
-            step = len(mg.members) / extras if extras > 0 else 1
-            for i in range(extras):
-                idx = min(int(i * step), len(mg.members) - 1)
-                weighted.append(mg.members[idx])
+    if not pairs:
+        return [], []
 
-    return sorted(weighted)
+    pairs.sort(key=lambda x: x[0])
+    members = [p[0] for p in pairs]
+    weights = [p[1] for p in pairs]
+    return members, weights
 
 
 # ─── Fetchers ──────────────────────────────────────────
@@ -337,7 +441,7 @@ async def fetch_ensemble_v2(session: aiohttp.ClientSession, city_key: str, targe
                     weight=MODEL_WEIGHTS.get(model_name, 1.0),
                 )
                 mg.mean = sum(members) / len(members)
-                mg.std = math.sqrt(sum((v - mg.mean) ** 2 for v in members) / len(members)) if len(members) > 1 else 0
+                mg.std = math.sqrt(sum((v - mg.mean) ** 2 for v in members) / (len(members) - 1)) if len(members) > 1 else 0
                 result.models.append(mg)
                 all_temps.extend(members)
 
@@ -347,14 +451,23 @@ async def fetch_ensemble_v2(session: aiohttp.ClientSession, city_key: str, targe
         result.all_members = sorted(all_temps)
         result.total_count = len(all_temps)
 
-        # Weighted ensemble
-        result.weighted_members = weight_ensemble_members(result.models)
+        # Weighted ensemble — raw members + per-member weights for KDE
+        result.weighted_members, result.member_weights = build_member_weights(result.models)
 
-        # Compute stats from weighted members (numpy for correct percentiles)
+        # Compute weighted stats (numpy)
         if result.weighted_members:
             wm_arr = np.asarray(result.weighted_members, dtype=np.float64)
-            result.mean = float(np.mean(wm_arr))
-            result.std = float(np.std(wm_arr))
+            w_arr = np.asarray(result.member_weights, dtype=np.float64)
+            w_norm = w_arr / w_arr.sum()
+            result.mean = float(np.average(wm_arr, weights=w_norm))
+            # Weighted sample variance: V1/(V1^2 - V2) * sum(w*(x-mean)^2)
+            v1 = w_norm.sum()  # = 1.0 after normalization
+            v2 = (w_norm ** 2).sum()
+            denom = v1 * v1 - v2
+            if denom > 0:
+                result.std = float(np.sqrt((w_norm * (wm_arr - result.mean) ** 2).sum() / denom))
+            else:
+                result.std = float(np.std(wm_arr, ddof=1))
             result.min_val = float(wm_arr[0])
             result.max_val = float(wm_arr[-1])
             result.p10 = float(np.percentile(wm_arr, 10))
@@ -363,6 +476,7 @@ async def fetch_ensemble_v2(session: aiohttp.ClientSession, city_key: str, targe
             result.p75 = float(np.percentile(wm_arr, 75))
             result.p90 = float(np.percentile(wm_arr, 90))
             result.kde_bandwidth = silverman_bandwidth(result.weighted_members)
+            result.is_bimodal = _detect_bimodal(np.sort(np.asarray(result.weighted_members)))
 
     except Exception as e:
         logger.error("Ensemble fetch failed for %s: %s", city_key, e)
@@ -384,11 +498,11 @@ async def fetch_nws(session: aiohttp.ClientSession, city_key: str, target_date) 
                 data = await resp.json()
                 props = data.get("properties", {})
                 temp_c = props.get("temperature", {}).get("value")
-                wind_ms = props.get("windSpeed", {}).get("value")
+                wind_kmh = props.get("windSpeed", {}).get("value")
                 if temp_c is not None:
                     result.current_temp = round(temp_c * 1.8 + 32, 1)
-                if wind_ms is not None:
-                    result.current_wind = round(wind_ms * 2.237, 1)
+                if wind_kmh is not None:
+                    result.current_wind = round(wind_kmh * 0.621371, 1)  # km/h → mph
     except Exception as e:
         logger.warning("NWS obs failed: %s", e)
 
@@ -423,7 +537,7 @@ async def fetch_nws(session: aiohttp.ClientSession, city_key: str, target_date) 
                 gust_str = p.get("windGust", {})
                 if isinstance(gust_str, dict):
                     gust_val = gust_str.get("value")
-                    gust_mph = float(gust_val) * 2.237 if gust_val is not None else 0
+                    gust_mph = float(gust_val) * 0.621371 if gust_val is not None else 0  # km/h → mph
                 elif isinstance(gust_str, str):
                     gust_match = re.search(r"(\d+)", gust_str)
                     gust_mph = float(gust_match.group(1)) if gust_match else 0
@@ -488,6 +602,15 @@ async def fetch_nws(session: aiohttp.ClientSession, city_key: str, target_date) 
             if depression >= 5:
                 factor = 0.40 if peak_precip >= 70 else 0.25
                 result.wet_bulb_penalty = round(depression * factor, 1)
+
+        # Cap stacked physics penalties: wind + wet bulb can over-correct together
+        total_penalty = result.wind_penalty + result.wet_bulb_penalty
+        MAX_COMBINED_PENALTY = 3.0  # Empirical cap — both effects share boundary layer physics
+        if total_penalty > MAX_COMBINED_PENALTY:
+            # Scale each penalty proportionally to preserve relative weights
+            scale = MAX_COMBINED_PENALTY / total_penalty
+            result.wind_penalty = round(result.wind_penalty * scale, 1)
+            result.wet_bulb_penalty = round(result.wet_bulb_penalty * scale, 1)
 
         result.physics_high = result.forecast_high - result.wind_penalty - result.wet_bulb_penalty
         if result.is_midnight_high:
@@ -575,25 +698,25 @@ def is_tomorrow_ticker(ticker: str, tomorrow_date) -> bool:
     return date_str in ticker
 
 
-def compute_confidence_score(ensemble: EnsembleV2, nws: NWSData, bracket_low: float = 0, bracket_high: float = 999) -> tuple[str, float, list[str]]:
+def compute_confidence_score(ensemble: EnsembleV2, nws: NWSData, bracket_low: float = 0,
+                             bracket_high: float = 999, lead_hours: float = 18.0) -> tuple[str, float, list[str]]:
     """
     Multi-factor confidence scoring — calibrated for 90+ threshold.
 
     Returns (label, score_0_to_100, reasons[])
 
-    The score is designed so that 90+ means:
-      - ALL major models agree on the bracket
-      - NWS forecast confirms the ensemble
-      - Real-time observations are tracking the forecast
-      - Low spread, high KDE probability in the target bracket
+    lead_hours: hours until settlement. Thresholds scale:
+      - At 6h: tighter thresholds (more certainty expected)
+      - At 18h: looser thresholds (wider spread is normal)
 
     Scoring:
       Base: 40 points
       Factor 1: Ensemble spread (σ)             → up to +15
       Factor 2: AIFS vs IFS agreement            → up to +15
-      Factor 3: Multi-model bracket agreement     → up to +15  (NEW)
+      Factor 3: Multi-model bracket agreement     → up to +15
       Factor 4: NWS alignment with ensemble       → up to +10
       Factor 5: Real-time trend confirmation      → up to +5
+      Factor 6: Lead-time bonus (short lead)      → up to +5
 
     Hard penalties (can push score negative):
       - Model spread > 4°F: -20
@@ -604,17 +727,28 @@ def compute_confidence_score(ensemble: EnsembleV2, nws: NWSData, bracket_low: fl
     score = 40.0  # Conservative baseline
     reasons = []
 
+    # Lead-time scaling factor: 1.0 at 18h, ~1.4 at 6h (tighter thresholds expected at short lead)
+    # At short lead, models should be tighter, so we scale thresholds down to be stricter
+    # Conversely, at long lead we relax thresholds
+    lt_scale = max(0.7, min(1.4, lead_hours / 18.0)) if lead_hours > 0 else 1.0
+
     # ── Factor 1: Ensemble spread (σ) ── max +15
-    if ensemble.std < 0.8:
+    # Thresholds scale with lead time: at 6h, expect σ < 0.5 for TIGHT; at 18h, σ < 0.8
+    t_tight = 0.8 * lt_scale
+    t_good = 1.2 * lt_scale
+    t_mod = 1.8 * lt_scale
+    t_wide = 2.5 * lt_scale
+
+    if ensemble.std < t_tight:
         score += 15
         reasons.append(f"σ={ensemble.std:.1f}° (TIGHT)")
-    elif ensemble.std < 1.2:
+    elif ensemble.std < t_good:
         score += 12
         reasons.append(f"σ={ensemble.std:.1f}° (good)")
-    elif ensemble.std < 1.8:
+    elif ensemble.std < t_mod:
         score += 6
         reasons.append(f"σ={ensemble.std:.1f}° (moderate)")
-    elif ensemble.std < 2.5:
+    elif ensemble.std < t_wide:
         reasons.append(f"σ={ensemble.std:.1f}° (wide)")
     else:
         score -= 20
@@ -688,6 +822,13 @@ def compute_confidence_score(ensemble: EnsembleV2, nws: NWSData, bracket_low: fl
         else:
             score -= 10
             reasons.append(f"NWS DIVERGES from ensemble (Δ{nws_div:.1f}°F ⚠)")
+    else:
+        # NWS data missing — neutral (don't penalize for NWS outage, which is
+        # outside our control; other factors still validate the setup)
+        if nws.forecast_high <= 0:
+            reasons.append("NWS forecast unavailable — skipping alignment check")
+        else:
+            reasons.append("Ensemble mean unavailable — skipping alignment check")
 
     # ── Factor 5: Real-time trend ── max +5
     if nws.temp_trend == "on_track":
@@ -701,6 +842,17 @@ def compute_confidence_score(ensemble: EnsembleV2, nws: NWSData, bracket_low: fl
         reasons.append("Current temp RUNNING COLD ⚠")
     else:
         reasons.append("No real-time trend data")
+
+    # ── Factor 6: Lead-time bonus ── max +5
+    # Short lead time = more certain forecast = bonus
+    if lead_hours <= 8:
+        score += 5
+        reasons.append(f"Lead time {lead_hours:.0f}h (SHORT — high certainty)")
+    elif lead_hours <= 12:
+        score += 2
+        reasons.append(f"Lead time {lead_hours:.0f}h (medium)")
+    else:
+        reasons.append(f"Lead time {lead_hours:.0f}h (long)")
 
     # Clamp
     score = max(0, min(100, score))
@@ -728,7 +880,10 @@ from config import (
     MAX_ENTRY_PRICE_CENTS,
     FREEROLL_MULTIPLIER,
     CAPITAL_EFFICIENCY_THRESHOLD_CENTS,
+    SETTLEMENT_HOUR_ET,
     LLM_CONFIDENCE_ENABLED,
+    TRADE_SCORE_ENABLED,
+    TRADE_SCORE_THRESHOLD,
 )
 
 # Alias for readability within this module
@@ -800,11 +955,22 @@ def analyze_opportunities_v2(
     nws: NWSData,
     brackets: list[dict],
     balance: float,
+    existing_exposure: dict = None,
 ) -> list[Opportunity]:
-    """Analyze brackets using KDE probabilities and weighted ensemble."""
+    """Analyze brackets using KDE probabilities and weighted ensemble.
+
+    existing_exposure: {city_key: dollar_exposure} of current open positions,
+    used to enforce MAX_CORRELATED_EXPOSURE across same-city positions.
+    """
     tz = ZoneInfo(CITIES[city_key]["tz"])
-    tomorrow = (datetime.now(tz) + timedelta(days=1)).date()
+    now_local = datetime.now(tz)
+    tomorrow = (now_local + timedelta(days=1)).date()
     entry_window, bot_risk = get_entry_timing(city_key)
+
+    # Compute lead time to settlement (tomorrow at SETTLEMENT_HOUR_ET in ET)
+    settlement_time = datetime.combine(tomorrow, datetime.min.time()).replace(
+        hour=SETTLEMENT_HOUR_ET, tzinfo=ZoneInfo("America/New_York"))
+    lead_hours = max(0, (settlement_time - datetime.now(ZoneInfo("America/New_York"))).total_seconds() / 3600)
 
     opps = []
     for mkt in brackets:
@@ -821,50 +987,56 @@ def analyze_opportunities_v2(
         yes_ask = mkt.get("yes_ask", 0)
         volume = mkt.get("volume", 0)
 
-        # KDE probability (weighted members)
+        # KDE probability (weighted members with per-member model weights)
         kde_prob = kde_probability(
             ensemble.weighted_members, low, high,
-            bandwidth=ensemble.kde_bandwidth
+            bandwidth=ensemble.kde_bandwidth,
+            weights=ensemble.member_weights,
         ) if ensemble.weighted_members else 0
 
-        # Histogram probability (for comparison)
-        hist_prob = (
-            sum(1 for t in ensemble.weighted_members if low <= t < high) / len(ensemble.weighted_members)
-            if ensemble.weighted_members else 0
-        )
+        # Histogram probability (weighted, for comparison)
+        if ensemble.weighted_members and ensemble.member_weights:
+            w_total = sum(ensemble.member_weights)
+            hist_prob = sum(w for t, w in zip(ensemble.weighted_members, ensemble.member_weights) if low <= t < high) / w_total if w_total > 0 else 0
+        elif ensemble.weighted_members:
+            hist_prob = sum(1 for t in ensemble.weighted_members if low <= t < high) / len(ensemble.weighted_members)
+        else:
+            hist_prob = 0
 
         # Use KDE as primary
         model_prob = kde_prob
 
-        market_prob_bid = yes_bid / 100 if yes_bid > 0 else 0.01
-        market_prob_ask = yes_ask / 100 if yes_ask > 0 else 0.99
+        # Edge computation against actual entry prices (bid+1 for maker pegging)
+        yes_entry = min(yes_bid + 1, MAX_ENTRY_PRICE) if yes_bid > 0 else 1
+        no_entry = min(100 - yes_ask + 1, MAX_ENTRY_PRICE) if yes_ask < 100 else 1
+        yes_entry_prob = yes_entry / 100
+        no_entry_prob = no_entry / 100
 
-        yes_edge = model_prob - market_prob_bid
-        no_edge = market_prob_ask - model_prob
+        yes_edge = model_prob - yes_entry_prob
+        no_edge = (1 - no_entry_prob) - model_prob  # NO edge: (1 - no_cost) - model_prob_yes = model_prob_no - no_cost
 
-        fee = taker_fee_cents(yes_bid if yes_edge > no_edge else yes_ask)
-
+        # Maker orders (bid+1) pay 0% fee, so no fee deduction needed
         if yes_edge > 0.04:
             side = "yes"
             edge_raw = yes_edge
-            edge_after = edge_raw - (fee / 100)
+            edge_after = edge_raw  # Maker = 0% fee
         elif no_edge > 0.04:
             side = "no"
             edge_raw = no_edge
-            edge_after = edge_raw - (fee / 100)
+            edge_after = edge_raw  # Maker = 0% fee
         else:
             continue
 
         if edge_after <= 0.01:
             continue
 
-        # ── Per-bracket confidence scoring (uses bracket bounds) ──
+        # ── Per-bracket confidence scoring (uses bracket bounds + lead time) ──
         confidence_label, confidence_score, _ = compute_confidence_score(
-            ensemble, nws, bracket_low=low, bracket_high=high
+            ensemble, nws, bracket_low=low, bracket_high=high, lead_hours=lead_hours
         )
 
         # ── Risk Management Gates ──
-        price_cents = yes_bid if side == "yes" else (100 - yes_ask)
+        price_cents = yes_entry if side == "yes" else no_entry
 
         # Gate 1: Minimum KDE probability
         if model_prob < MIN_KDE_PROBABILITY and side == "yes":
@@ -882,11 +1054,19 @@ def analyze_opportunities_v2(
 
         # Kelly & sizing
         if side == "yes":
-            k = kelly_fraction(model_prob, market_prob_bid)
+            k = kelly_fraction(model_prob, yes_entry_prob)
         else:
-            k = kelly_fraction(1 - model_prob, 1 - market_prob_ask)
+            k = kelly_fraction(1 - model_prob, no_entry_prob)
 
         max_cost = balance * MAX_POSITION_PCT
+
+        # Correlated exposure cap: limit total exposure per city
+        if existing_exposure:
+            city_exposure = existing_exposure.get(city_key, 0.0)
+            correlated_max = balance * MAX_CORRELATED_EXPOSURE
+            remaining_city_budget = max(0, correlated_max - city_exposure)
+            max_cost = min(max_cost, remaining_city_budget)
+
         suggested = min(100, int(max_cost / (max(price_cents, 1) / 100))) if price_cents > 0 else 0
 
         # Strategy flags
@@ -904,7 +1084,7 @@ def analyze_opportunities_v2(
 
         # Rationale
         parts = []
-        if model_prob > 0.3 and market_prob_bid < 0.10:
+        if model_prob > 0.3 and yes_entry_prob < 0.10:
             parts.append("MASSIVE MISPRICING")
         if abs(kde_prob - hist_prob) > 0.02:
             parts.append(f"KDE={kde_prob*100:.0f}% vs Hist={hist_prob*100:.0f}%")
@@ -947,9 +1127,32 @@ def analyze_opportunities_v2(
             entry_window=entry_window,
             bot_risk=bot_risk,
         )
+
+        # Compute hybrid trade score
+        try:
+            from trade_score import compute_trade_score as _compute_ts
+            ts = _compute_ts(opp, lead_hours)
+            opp.trade_score = round(ts.score, 4)
+            opp.trade_score_components = {
+                "confidence_signal": round(ts.confidence_signal, 4),
+                "edge_signal": round(ts.edge_signal, 4),
+                "urgency_signal": round(ts.urgency_signal, 4),
+                "liquidity_penalty": round(ts.liquidity_penalty, 4),
+                "w_confidence": round(ts.w_confidence, 4),
+                "w_edge": round(ts.w_edge, 4),
+                "w_urgency": round(ts.w_urgency, 4),
+                "hours_to_settlement": round(lead_hours, 1),
+                "tradeable": ts.tradeable,
+            }
+        except Exception as e:
+            logger.warning("trade_score computation failed for %s: %s", opp.ticker, e)
+
         opps.append(opp)
 
-    opps.sort(key=lambda x: (x.confidence_score >= MIN_CONFIDENCE_TO_TRADE, x.edge_after_fees), reverse=True)
+    if TRADE_SCORE_ENABLED:
+        opps.sort(key=lambda x: x.trade_score, reverse=True)
+    else:
+        opps.sort(key=lambda x: (x.confidence_score >= MIN_CONFIDENCE_TO_TRADE, x.edge_after_fees), reverse=True)
     return opps
 
 
@@ -999,7 +1202,11 @@ def print_city_report_v2(
     tz = ZoneInfo(city["tz"])
     tomorrow = (datetime.now(tz) + timedelta(days=1)).date()
     entry_window, bot_risk = get_entry_timing(city_key)
-    conf_label, conf_score, conf_reasons = compute_confidence_score(ensemble, nws)
+    # Compute lead time for display report
+    settlement_time = datetime.combine(tomorrow, datetime.min.time()).replace(
+        hour=SETTLEMENT_HOUR_ET, tzinfo=ZoneInfo("America/New_York"))
+    _lead_hours = max(0, (settlement_time - datetime.now(ZoneInfo("America/New_York"))).total_seconds() / 3600)
+    conf_label, conf_score, conf_reasons = compute_confidence_score(ensemble, nws, lead_hours=_lead_hours)
 
     print(f"\n{'='*72}")
     print(f"  {city['name'].upper()} — {tomorrow.strftime('%A %B %d, %Y')}")
@@ -1012,7 +1219,8 @@ def print_city_report_v2(
         print(f"  ├─ Mean: {ensemble.mean:.1f}°F  ±{ensemble.std:.1f}°  (Median: {ensemble.median:.1f}°F)")
         print(f"  ├─ Range: {ensemble.min_val:.0f}°F → {ensemble.max_val:.0f}°F")
         print(f"  ├─ P10={ensemble.p10:.0f}  P25={ensemble.p25:.0f}  P50={ensemble.p50:.0f}  P75={ensemble.p75:.0f}  P90={ensemble.p90:.0f}")
-        print(f"  └─ KDE bandwidth: {ensemble.kde_bandwidth:.2f}°F (Silverman)")
+        bimodal_tag = " ⚠ BIMODAL — adaptive BW" if ensemble.is_bimodal else " (Silverman)"
+        print(f"  └─ KDE bandwidth: {ensemble.kde_bandwidth:.2f}°F{bimodal_tag}")
 
     print_model_breakdown(ensemble)
 
@@ -1062,8 +1270,14 @@ def print_city_report_v2(
             vol = mkt.get("volume", 0)
 
             low, high, _ = parse_bracket_range(title)
-            kde_p = kde_probability(ensemble.weighted_members, low, high, ensemble.kde_bandwidth) * 100 if ensemble.weighted_members else 0
-            hist_p = (sum(1 for t in ensemble.weighted_members if low <= t < high) / len(ensemble.weighted_members) * 100) if ensemble.weighted_members else 0
+            kde_p = kde_probability(ensemble.weighted_members, low, high, ensemble.kde_bandwidth, weights=ensemble.member_weights) * 100 if ensemble.weighted_members else 0
+            if ensemble.weighted_members and ensemble.member_weights:
+                w_total = sum(ensemble.member_weights)
+                hist_p = (sum(w for t, w in zip(ensemble.weighted_members, ensemble.member_weights) if low <= t < high) / w_total * 100) if w_total > 0 else 0
+            elif ensemble.weighted_members:
+                hist_p = (sum(1 for t in ensemble.weighted_members if low <= t < high) / len(ensemble.weighted_members) * 100)
+            else:
+                hist_p = 0
 
             edge = kde_p - bid
             marker = " ⚡" if abs(edge) > 10 else " ●" if abs(edge) > 5 else ""
@@ -1082,7 +1296,10 @@ def print_city_report_v2(
             side_label = "YES" if opp.side == "yes" else "NO"
             price = opp.yes_bid if opp.side == "yes" else (100 - opp.yes_ask)
             short = shorten_bracket_title(opp.bracket_title)
-            tradeable = opp.confidence_score >= MIN_CONFIDENCE_TO_TRADE
+            if TRADE_SCORE_ENABLED and opp.trade_score > 0:
+                tradeable = opp.trade_score_components.get("tradeable", False)
+            else:
+                tradeable = opp.confidence_score >= MIN_CONFIDENCE_TO_TRADE
             gate_icon = "★" if tradeable else "○"
 
             print(f"\n  {gate_icon} [{i}] {side_label} {short} @ {price}¢ {'— TRADEABLE' if tradeable else '— observe only'}")
@@ -1091,6 +1308,9 @@ def print_city_report_v2(
             print(f"      Edge:       {opp.edge_raw*100:+.1f}¢ raw → {opp.edge_after_fees*100:+.1f}¢ net")
             print(f"      Kelly:      {opp.kelly*100:.1f}% → {opp.suggested_contracts} contracts")
             print(f"      Confidence: {opp.confidence} ({opp.confidence_score:.0f}/100)")
+            if opp.trade_score > 0:
+                ts_label = "TRADEABLE" if tradeable else "observe"
+                print(f"      TradeScore: {opp.trade_score:.3f} ({ts_label})")
             if opp.strategies:
                 print(f"      Strategies: {', '.join(opp.strategies)}")
             print(f"      Rationale:  {opp.rationale}")
@@ -1104,29 +1324,46 @@ def print_summary_v2(all_opps: list[Opportunity], balance: float):
     print(f"{'='*72}")
     print(f"  Balance:       ${balance:.2f}")
     print(f"  Opportunities: {len(all_opps)}")
-    tradeable = [o for o in all_opps if o.confidence_score >= MIN_CONFIDENCE_TO_TRADE]
-    print(f"  Tradeable:     {len(tradeable)} (conf ≥ {MIN_CONFIDENCE_TO_TRADE})")
+    if TRADE_SCORE_ENABLED:
+        tradeable = [o for o in all_opps if o.trade_score_components.get("tradeable", False)]
+        print(f"  Tradeable:     {len(tradeable)} (trade_score ≥ {TRADE_SCORE_THRESHOLD})")
+    else:
+        tradeable = [o for o in all_opps if o.confidence_score >= MIN_CONFIDENCE_TO_TRADE]
+        print(f"  Tradeable:     {len(tradeable)} (conf ≥ {MIN_CONFIDENCE_TO_TRADE})")
     print(f"  Min Edge:      {MIN_EDGE_THRESHOLD*100:.0f}%  |  Min KDE: {MIN_KDE_PROBABILITY*100:.0f}%  |  Max Entry: {MAX_ENTRY_PRICE}¢")
 
     if not all_opps:
         print(f"\n  No opportunities above threshold. Check again at next model run.")
         return
 
-    ranked = sorted(all_opps, key=lambda x: (x.confidence_score >= MIN_CONFIDENCE_TO_TRADE, x.edge_after_fees), reverse=True)
+    if TRADE_SCORE_ENABLED:
+        ranked = sorted(all_opps, key=lambda x: x.trade_score, reverse=True)
+    else:
+        ranked = sorted(all_opps, key=lambda x: (x.confidence_score >= MIN_CONFIDENCE_TO_TRADE, x.edge_after_fees), reverse=True)
 
-    print(f"\n  {'#':<3} {'':>1} {'City':<5} {'Side':<4} {'Bracket':<16} {'Price':>5} {'KDE':>5} {'Edge':>8} {'Conf':>5}")
-    print(f"  {'─'*3} {'─':>1} {'─'*5} {'─'*4} {'─'*16} {'─'*5} {'─'*5} {'─'*8} {'─'*5}")
+    print(f"\n  {'#':<3} {'':>1} {'City':<5} {'Side':<4} {'Bracket':<16} {'Price':>5} {'KDE':>5} {'Edge':>8} {'Conf':>5} {'TS':>5}")
+    print(f"  {'─'*3} {'─':>1} {'─'*5} {'─'*4} {'─'*16} {'─'*5} {'─'*5} {'─'*8} {'─'*5} {'─'*5}")
 
     for i, opp in enumerate(ranked[:10], 1):
         price = opp.yes_bid if opp.side == "yes" else (100 - opp.yes_ask)
         short = shorten_bracket_title(opp.bracket_title)
-        gate = "★" if opp.confidence_score >= MIN_CONFIDENCE_TO_TRADE else " "
-        print(f"  {i:<3} {gate:>1} {opp.city:<5} {opp.side.upper():<4} {short:<16} {price:>4}¢ {opp.kde_prob*100:>4.0f}% {opp.edge_after_fees*100:>+7.1f}¢ {opp.confidence_score:>4.0f}")
+        if TRADE_SCORE_ENABLED:
+            gate = "★" if opp.trade_score_components.get("tradeable", False) else " "
+        else:
+            gate = "★" if opp.confidence_score >= MIN_CONFIDENCE_TO_TRADE else " "
+        ts_str = f"{opp.trade_score:.2f}" if opp.trade_score > 0 else "  —"
+        print(f"  {i:<3} {gate:>1} {opp.city:<5} {opp.side.upper():<4} {short:<16} {price:>4}¢ {opp.kde_prob*100:>4.0f}% {opp.edge_after_fees*100:>+7.1f}¢ {opp.confidence_score:>4.0f} {ts_str:>5}")
 
     if tradeable:
-        print(f"\n  ★ = TRADEABLE (confidence ≥ {MIN_CONFIDENCE_TO_TRADE})")
+        if TRADE_SCORE_ENABLED:
+            print(f"\n  ★ = TRADEABLE (trade_score ≥ {TRADE_SCORE_THRESHOLD})")
+        else:
+            print(f"\n  ★ = TRADEABLE (confidence ≥ {MIN_CONFIDENCE_TO_TRADE})")
     else:
-        print(f"\n  No opportunities meet the {MIN_CONFIDENCE_TO_TRADE}+ confidence gate.")
+        if TRADE_SCORE_ENABLED:
+            print(f"\n  No opportunities meet the trade score threshold ({TRADE_SCORE_THRESHOLD}).")
+        else:
+            print(f"\n  No opportunities meet the {MIN_CONFIDENCE_TO_TRADE}+ confidence gate.")
         print(f"  This is NORMAL — high-confidence setups appear 2-5 times per week.")
 
 
@@ -1139,6 +1376,7 @@ def _save_snapshot(city_key: str, target_date, ensemble: EnsembleV2, nws: NWSDat
             "std": ensemble.std,
             "total_count": ensemble.total_count,
             "kde_bandwidth": ensemble.kde_bandwidth,
+            "is_bimodal": ensemble.is_bimodal,
             "p10": ensemble.p10,
             "p25": ensemble.p25,
             "p50": ensemble.p50,
@@ -1163,9 +1401,12 @@ def _save_snapshot(city_key: str, target_date, ensemble: EnsembleV2, nws: NWSDat
                     "kde_prob": round(o.kde_prob, 4),
                     "confidence_score": round(o.confidence_score, 1),
                     "edge": round(o.edge_after_fees, 4),
+                    "trade_score": round(o.trade_score, 4),
+                    "trade_score_components": o.trade_score_components,
                 }
                 for o in opps
             ],
+            "trade_score_threshold": TRADE_SCORE_THRESHOLD,
         }
         save_ensemble_snapshot(city_key, datetime.combine(target_date, datetime.min.time()), snapshot)
     except Exception as e:
@@ -1192,6 +1433,27 @@ async def scan(city_filter: str = None, show_timing: bool = False):
 
     cities_to_scan = {city_filter.upper(): CITIES[city_filter.upper()]} if city_filter else CITIES
 
+    # ── Startup validation ──
+    import os
+    startup_warnings = []
+    key_id = os.environ.get("KALSHI_API_KEY_ID", "")
+    key_path_str = os.environ.get("KALSHI_PRIVATE_KEY_PATH", "")
+    if not key_id:
+        startup_warnings.append("KALSHI_API_KEY_ID not set in .env — trade execution will fail")
+    if not key_path_str:
+        startup_warnings.append("KALSHI_PRIVATE_KEY_PATH not set in .env — trade execution will fail")
+    elif not Path(key_path_str).exists():
+        startup_warnings.append(f"KALSHI_PRIVATE_KEY_PATH file not found: {key_path_str}")
+    discord_url = os.environ.get("DISCORD_WEBHOOK_URL", "")
+    if not discord_url:
+        startup_warnings.append("DISCORD_WEBHOOK_URL not set — alerts will fall back to file")
+
+    if startup_warnings:
+        print(f"\n  ⚠ STARTUP WARNINGS:")
+        for sw in startup_warnings:
+            print(f"    └─ {sw}")
+            logger.warning("Startup: %s", sw)
+
     # Balance
     balance = 0.0
     try:
@@ -1201,6 +1463,27 @@ async def scan(city_filter: str = None, show_timing: bool = False):
             print(f"\n  Account Balance: ${balance:.2f}")
     except Exception as e:
         logger.warning("Balance fetch: %s", e)
+
+    # Compute existing exposure per city from open positions
+    existing_exposure = {}
+    try:
+        from position_store import load_positions
+        import re as _re
+        open_pos = [p for p in load_positions() if p.get("status") in ("open", "resting", "pending_sell")]
+        # Map series tickers back to city codes
+        series_to_city = {cfg["series"]: code for code, cfg in CITIES.items()}
+        for p in open_pos:
+            ticker = p.get("ticker", "")
+            match = _re.match(r'^([A-Z]+)', ticker)
+            if match:
+                city_code = series_to_city.get(match.group(1))
+                if city_code:
+                    cost = p.get("contracts", 0) * p.get("avg_price", 0) / 100
+                    existing_exposure[city_code] = existing_exposure.get(city_code, 0) + cost
+        if existing_exposure:
+            print(f"  Existing exposure: {', '.join(f'{c}=${v:.2f}' for c, v in existing_exposure.items())}")
+    except Exception as e:
+        logger.debug("Could not load positions for exposure check: %s", e)
 
     tz = ZoneInfo("America/New_York")
     tomorrow = (datetime.now(tz) + timedelta(days=1)).date()
@@ -1222,19 +1505,53 @@ async def scan(city_filter: str = None, show_timing: bool = False):
 
                 results = await asyncio.gather(ens_task, nws_task, mkt_task, return_exceptions=True)
 
-                # Check for exceptions in any fetch
-                errors = [r for r in results if isinstance(r, Exception)]
-                if errors:
-                    error_msgs = [f"{type(e).__name__}: {e}" for e in errors]
+                # Check for exceptions in any fetch — each result must be typed correctly
+                fetch_labels = ["ensemble", "NWS", "brackets"]
+                error_msgs = []
+                for i, r in enumerate(results):
+                    if isinstance(r, BaseException):
+                        error_msgs.append(f"{fetch_labels[i]}: {type(r).__name__}: {r}")
+                if error_msgs:
                     raise RuntimeError(f"Fetch errors: {'; '.join(error_msgs)}")
 
                 ensemble, nws_data, brackets = results
 
+                # Defensive: verify results are correct types (not exceptions that slipped through)
+                if isinstance(ensemble, BaseException) or isinstance(nws_data, BaseException) or isinstance(brackets, BaseException):
+                    raise RuntimeError("Unexpected exception in fetch results after type check")
+
+                # ── Data source health checks ──
+                data_warnings = []
+                if ensemble.total_count == 0:
+                    data_warnings.append("ENSEMBLE: 0 members (Open-Meteo may be down)")
+                elif ensemble.total_count < 100:
+                    data_warnings.append(f"ENSEMBLE: only {ensemble.total_count} members (expected ~194)")
+                if nws_data.forecast_high <= 0:
+                    data_warnings.append("NWS: no forecast high (NWS API may be down)")
+                if nws_data.current_temp <= 0:
+                    data_warnings.append("NWS: no current observation (trend detection disabled)")
+                if not brackets:
+                    data_warnings.append("KALSHI: no brackets returned (API may be down or no markets)")
+
+                if data_warnings:
+                    print(f"    ⚠ DATA WARNINGS for {city_key}:")
+                    for w in data_warnings:
+                        print(f"      └─ {w}")
+                        logger.warning("Data health: %s — %s", city_key, w)
+
+                # If critical data is missing, skip city entirely
+                if ensemble.total_count == 0 or not brackets:
+                    failed_cities.append(city_key)
+                    reason = "no ensemble data" if ensemble.total_count == 0 else "no market brackets"
+                    print(f"    ✗ {city_key} SKIPPED — {reason}")
+                    continue
+
                 print(f"    Ensemble: {ensemble.total_count} raw members → {len(ensemble.weighted_members)} weighted")
-                print(f"    Mean: {ensemble.mean:.1f}°F ±{ensemble.std:.1f}  KDE bw: {ensemble.kde_bandwidth:.2f}")
+                bimodal_flag = " [BIMODAL]" if ensemble.is_bimodal else ""
+                print(f"    Mean: {ensemble.mean:.1f}°F ±{ensemble.std:.1f}  KDE bw: {ensemble.kde_bandwidth:.2f}{bimodal_flag}")
                 print(f"    NWS: {nws_data.forecast_high:.0f}°F  Physics: {nws_data.physics_high:.1f}°F")
 
-                opps = analyze_opportunities_v2(city_key, ensemble, nws_data, brackets, balance)
+                opps = analyze_opportunities_v2(city_key, ensemble, nws_data, brackets, balance, existing_exposure)
 
                 # ── LLM Confidence Blend (if enabled) ──
                 llm_module = _get_llm_module()
@@ -1288,7 +1605,14 @@ async def scan(city_filter: str = None, show_timing: bool = False):
                 continue
 
     if failed_cities:
-        print(f"\n  ⚠ Failed cities: {', '.join(failed_cities)} ({len(cities_to_scan) - len(failed_cities)}/{len(cities_to_scan)} scanned)")
+        n_ok = len(cities_to_scan) - len(failed_cities)
+        print(f"\n  ⚠ FAILED CITIES: {', '.join(failed_cities)} ({n_ok}/{len(cities_to_scan)} scanned)")
+        if n_ok == 0:
+            print(f"  ✗ ALL CITIES FAILED — check internet connection and API status")
+            logger.error("ALL cities failed scan — possible API outage or network issue")
+        elif len(failed_cities) >= len(cities_to_scan) // 2:
+            print(f"  ⚠ MAJORITY FAILED — results may be unreliable, check data sources")
+            logger.warning("Majority of cities failed: %s", failed_cities)
 
     print_summary_v2(all_opps, balance)
 
